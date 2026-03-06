@@ -165,6 +165,10 @@ def detect_on_off_times(t: np.ndarray, y: np.ndarray, smooth_window: int = 11, e
     t, y = clean_sort_xy(t, y)
     ys = rolling_median(y, smooth_window)
     dy = np.gradient(ys, t)
+    dwin = int(max(5, smooth_window))
+    if dwin % 2 == 0:
+        dwin += 1
+    dy_s = pd.Series(dy).rolling(window=dwin, center=True, min_periods=1).mean().to_numpy(dtype=float)
 
     n = len(t)
     edge = max(2, int(edge_frac * n))
@@ -172,21 +176,24 @@ def detect_on_off_times(t: np.ndarray, y: np.ndarray, smooth_window: int = 11, e
     if hi <= lo:
         lo, hi = 1, n - 1
 
-    on_idx = lo + int(np.argmax(dy[lo:hi]))
+    on_idx = lo + int(np.argmax(dy_s[lo:hi]))
     min_gap = max(3, int(0.05 * n))
     off_start = min(n - 2, on_idx + min_gap)
+    # Ensure OFF search starts after the heating peak when possible.
+    peak_idx = on_idx + int(np.argmax(ys[on_idx:hi])) if on_idx < hi else on_idx
+    off_start = max(off_start, min(peak_idx, n - 2))
     if off_start >= hi:
         off_start = min(n - 2, on_idx + 1)
 
     if off_start < hi:
-        off_idx = off_start + int(np.argmin(dy[off_start:hi]))
+        off_idx = off_start + int(np.argmin(dy_s[off_start:hi]))
     else:
         off_idx = n - 1
 
     if off_idx <= on_idx:
         off_idx = min(n - 1, on_idx + 1)
 
-    return float(t[on_idx]), float(t[off_idx]), ys, dy
+    return float(t[on_idx]), float(t[off_idx]), ys, dy_s
 
 
 def build_input_profile(t: np.ndarray, t_on: float, t_off: float, u_on: float) -> np.ndarray:
@@ -207,6 +214,20 @@ def simulate_first_order_deviation(t: np.ndarray, u: np.ndarray, Kp: float, tau:
     return x
 
 
+def simulate_first_order_deviation_exact(t: np.ndarray, u: np.ndarray, Kp: float, tau: float, x0: float) -> np.ndarray:
+    """Exact zero-order-hold update for dT/dt = (-T + Kp*u)/tau."""
+    tau = float(max(tau, 1e-9))
+    x = np.zeros_like(t, dtype=float)
+    x[0] = float(x0)
+
+    for i in range(1, len(t)):
+        dt_i = float(max(t[i] - t[i - 1], 1e-9))
+        a = float(np.exp(-dt_i / tau))
+        x[i] = x[i - 1] * a + float(Kp) * float(u[i - 1]) * (1.0 - a)
+
+    return x
+
+
 def fit_full_model_global(run_rows):
     # Initial guess from observed change and ON-level.
     kp_guess_list, tau_guess_list = [], []
@@ -218,24 +239,56 @@ def fit_full_model_global(run_rows):
     kp0 = float(np.nanmedian(kp_guess_list)) if kp_guess_list else 0.1
     tau0 = float(np.nanmedian(tau_guess_list)) if tau_guess_list else 30.0
     dt_list = []
+    span_list = []
     for rr in run_rows:
         dt_rr = np.diff(rr["t"])
         dt_rr = dt_rr[np.isfinite(dt_rr) & (dt_rr > 0)]
         if dt_rr.size:
             dt_list.append(np.median(dt_rr))
-    tau_min = max(1e-6, 0.05 * float(np.median(dt_list))) if dt_list else 1e-6
+        span_list.append(float(max(rr["t"][-1] - rr["t"][0], 1.0)))
+    dt_med = float(np.median(dt_list)) if dt_list else 1.0
+    tau_min = max(1e-6, 0.5 * dt_med)
+    tau_max = max(1e3, 10.0 * float(np.median(span_list)) if span_list else 1e4)
+
+    # Physical sign constraint for Kp from average ON response direction.
+    kp_dir = []
+    for rr in run_rows:
+        on = (rr["t"] >= rr["t_on"]) & (rr["t"] < rr["t_off"])
+        pre = rr["t"] < rr["t_on"]
+        if np.sum(on) >= 3:
+            y_on = float(np.mean(rr["T_dev"][on]))
+            y_pre = float(np.mean(rr["T_dev"][pre])) if np.sum(pre) >= 3 else 0.0
+            kp_dir.append((y_on - y_pre) / max(abs(rr["u_on"]), 1e-9))
+    kp_sign = np.nanmedian(kp_dir) if kp_dir else kp0
+    kp_lb, kp_ub = (0.0, np.inf) if kp_sign >= 0 else (-np.inf, 0.0)
+
+    # Segment-balanced weights so long cooling tails do not dominate the fit.
+    run_w = []
+    for rr in run_rows:
+        pre = rr["t"] < rr["t_on"]
+        on = (rr["t"] >= rr["t_on"]) & (rr["t"] < rr["t_off"])
+        post = rr["t"] >= rr["t_off"]
+        w = np.ones_like(rr["t"], dtype=float)
+        n_pre = max(int(np.sum(pre)), 1)
+        n_on = max(int(np.sum(on)), 1)
+        n_post = max(int(np.sum(post)), 1)
+        w[pre] = 0.5 / n_pre
+        w[on] = 1.0 / n_on
+        w[post] = 1.0 / n_post
+        w = w * (len(w) / np.sum(w))
+        run_w.append(w)
 
     def sse_obj(p):
         kp, tau = float(p[0]), float(p[1])
         if tau <= tau_min or not np.isfinite(kp) or not np.isfinite(tau):
             return 1e30
         sse = 0.0
-        for rr in run_rows:
-            pred = simulate_first_order_deviation(rr["t"], rr["u"], kp, tau, rr["T_dev"][0])
+        for rr, w in zip(run_rows, run_w):
+            pred = simulate_first_order_deviation_exact(rr["t"], rr["u"], kp, tau, rr.get("x0", 0.0))
             if not np.all(np.isfinite(pred)):
                 return 1e30
             err = rr["T_dev"] - pred
-            sse_i = float(np.sum(err ** 2))
+            sse_i = float(np.sum(w * (err ** 2)))
             if not np.isfinite(sse_i):
                 return 1e30
             sse += sse_i
@@ -246,35 +299,50 @@ def fit_full_model_global(run_rows):
         if tau <= tau_min or not np.isfinite(kp) or not np.isfinite(tau):
             return np.full(sum(len(rr["t"]) for rr in run_rows), 1e12, dtype=float)
         out = []
-        for rr in run_rows:
-            pred = simulate_first_order_deviation(rr["t"], rr["u"], kp, tau, rr["T_dev"][0])
+        for rr, w in zip(run_rows, run_w):
+            pred = simulate_first_order_deviation_exact(rr["t"], rr["u"], kp, tau, rr.get("x0", 0.0))
             if not np.all(np.isfinite(pred)):
                 return np.full(sum(len(r["t"]) for r in run_rows), 1e12, dtype=float)
-            out.append(rr["T_dev"] - pred)
+            out.append((rr["T_dev"] - pred) * np.sqrt(w))
         return np.concatenate(out)
 
-    opt = minimize(
-        sse_obj,
-        x0=np.array([kp0, tau0], dtype=float),
-        method="L-BFGS-B",
-        bounds=[(None, None), (tau_min, 1e8)],
-    )
-    if opt.success and np.all(np.isfinite(opt.x)):
-        kp_hat, tau_hat = map(float, opt.x)
-    else:
+    # Multi-start to reduce local-minimum sensitivity.
+    starts = [
+        np.array([kp0, max(tau0, tau_min)], dtype=float),
+        np.array([kp0 * 0.5, max(tau0 * 0.5, tau_min)], dtype=float),
+        np.array([kp0 * 1.5, min(max(tau0 * 2.0, tau_min), tau_max)], dtype=float),
+    ]
+    best_x = None
+    best_sse = np.inf
+    last_msg = ""
+    for x0_try in starts:
+        opt = minimize(
+            sse_obj,
+            x0=x0_try,
+            method="L-BFGS-B",
+            bounds=[(kp_lb, kp_ub), (tau_min, tau_max)],
+        )
+        if opt.success and np.all(np.isfinite(opt.x)) and np.isfinite(opt.fun) and opt.fun < best_sse:
+            best_x = opt.x
+            best_sse = float(opt.fun)
+        last_msg = str(opt.message)
+
+    if best_x is None:
         lsq = least_squares(
             resid_vec,
-            x0=np.array([kp0, tau0], dtype=float),
-            bounds=([-np.inf, tau_min], [np.inf, 1e8]),
-            max_nfev=20000,
+            x0=starts[0],
+            bounds=([kp_lb, tau_min], [kp_ub, tau_max]),
+            max_nfev=30000,
         )
         if not lsq.success or not np.all(np.isfinite(lsq.x)):
-            raise ValueError(f"Optimization failed: {opt.message}")
-        kp_hat, tau_hat = map(float, lsq.x)
+            raise ValueError(f"Optimization failed: {last_msg}")
+        best_x = lsq.x
+
+    kp_hat, tau_hat = map(float, best_x)
 
     all_y, all_yhat, per_run = [], [], []
     for rr in run_rows:
-        pred_dev = simulate_first_order_deviation(rr["t"], rr["u"], kp_hat, tau_hat, rr["T_dev"][0])
+        pred_dev = simulate_first_order_deviation_exact(rr["t"], rr["u"], kp_hat, tau_hat, rr.get("x0", 0.0))
         pred_T = rr["T_base"] + pred_dev
         resid = rr["T"] - pred_T
         sse = float(np.sum(resid ** 2))
@@ -699,6 +767,7 @@ if cheg_auto_enabled:
                 "t_on": t_on,
                 "t_off": t_off,
                 "T_base": T_base,
+                "x0": 0.0,
             })
 
         if not analyses:
@@ -998,6 +1067,7 @@ if full_mode:
         "t_on": t_on,
         "t_off": t_off,
         "T_base": T_base,
+        "x0": 0.0,
     }]
 
     if fit_btn:
