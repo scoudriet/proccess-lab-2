@@ -434,9 +434,19 @@ with st.sidebar:
             index=0
         )
         t0_manual = st.number_input("t₀ (if manual)", value=0.0, step=0.1)
+        std_auto_split = st.checkbox("Auto split heating/cooling (apply to this mode)", value=True)
+        std_segment_choice = st.radio("Analyze segment", ["Heating", "Cooling"], index=0)
+        std_override_on_off = st.checkbox("Override ON/OFF manually", value=False)
+        std_on_manual = st.number_input("ON time for split (s)", value=0.0, step=1.0)
+        std_off_manual = st.number_input("OFF time for split (s)", value=60.0, step=1.0)
     else:
         step_mode = "Auto-detect t₀ from data"
         t0_manual = 0.0
+        std_auto_split = True
+        std_segment_choice = "Heating"
+        std_override_on_off = False
+        std_on_manual = 0.0
+        std_off_manual = 60.0
 
         st.subheader("Full-model input")
         u_on = st.number_input("Heater percent while ON", value=100.0, step=1.0)
@@ -1061,11 +1071,42 @@ if full_mode:
 
     st.stop()
 
-t_raw = df[t_col].to_numpy()
-y_raw = df[y_col].to_numpy()
+# Robust time parsing for all standard modes.
+try:
+    t_raw = parse_time_to_elapsed_seconds(df[t_col])
+except Exception:
+    t_raw = pd.to_numeric(df[t_col], errors="coerce").to_numpy(dtype=float)
+
+y_raw = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
+m_std = np.isfinite(t_raw) & np.isfinite(y_raw)
+t_raw = t_raw[m_std]
+y_raw = y_raw[m_std]
 t_raw, y_raw = clean_sort_xy(t_raw, y_raw)
 
 y_smooth = moving_average(y_raw, smooth_window)
+
+# Split detection (heating/cooling) for standard modes.
+t_on_std, t_off_std = float(t_raw[0]), float(t_raw[-1])
+if std_auto_split:
+    if std_override_on_off:
+        t_on_std = float(std_on_manual)
+        t_off_std = float(std_off_manual)
+    else:
+        t_on_std, t_off_std, _, _ = detect_on_off_times(t_raw, y_raw, smooth_window=smooth_window)
+    if t_off_std <= t_on_std:
+        st.warning("Auto split produced invalid ON/OFF; using full data.")
+        std_auto_split = False
+
+fit_mask = np.ones_like(t_raw, dtype=bool)
+if std_auto_split:
+    if std_segment_choice == "Heating":
+        fit_mask = (t_raw >= t_on_std) & (t_raw < t_off_std)
+    else:
+        fit_mask = t_raw >= t_off_std
+    if np.sum(fit_mask) < 5:
+        st.warning(f"{std_segment_choice} split has too few points; using full data.")
+        fit_mask = np.ones_like(t_raw, dtype=bool)
+        std_auto_split = False
 
 # Determine t0
 if step_mode == "Assume t₀ = 0":
@@ -1076,7 +1117,11 @@ else:
     t0 = estimate_step_time(t_raw, y_raw, window=smooth_window)
 
 # Choose data for fit (raw vs smoothed)
-y_fit_data = y_smooth if use_smoothed_for_fit else y_raw
+y_fit_data_full = y_smooth if use_smoothed_for_fit else y_raw
+t_fit = t_raw[fit_mask]
+y_fit_data = y_fit_data_full[fit_mask]
+if std_auto_split:
+    t0 = float(t_on_std if std_segment_choice == "Heating" else t_off_std)
 
 tabs = st.tabs(["Plot", "Results", "Download / Export"])
 
@@ -1088,6 +1133,9 @@ with tabs[0]:
     ax.plot(t_raw, y_raw, marker="o", linestyle="None", label="Raw data")
     ax.plot(t_raw, y_smooth, linestyle="-", label=f"Smoothed (window={smooth_window})")
     ax.axvline(t0, linestyle="--", label=f"t₀ = {t0:g}")
+    if std_auto_split:
+        ax.axvspan(t_on_std, t_off_std, alpha=0.12, color="tab:green", label="Heating split")
+        ax.axvspan(t_off_std, t_raw[-1], alpha=0.08, color="tab:blue", label="Cooling split")
     ax.set_xlabel("t")
     ax.set_ylabel("y")
     ax.grid(True)
@@ -1098,19 +1146,19 @@ with tabs[0]:
         try:
             if model == "Fit Ka & τ (board style)":
                 # Ka fitter expects t0 and fit_y0 per the updated fit_model.py
-                result = fit_Ka_tau(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+                result = fit_Ka_tau(t_fit, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
                 ax.plot(result["t"], result["y_fit"], linewidth=2, label="Fit (Ka, τ)")
             elif model == "Fit 2nd-order Ka, τ1, τ2":
-                result = fit_Ka_tau2(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+                result = fit_Ka_tau2(t_fit, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
                 ax.plot(result["t"], result["y_fit"], linewidth=2, label="Fit (Ka, τ1, τ2)")
             else:
                 if fit_K_tau_with_a is None:
                     st.error("K-with-a model not available. Create fit_model_with_a.py and restart Streamlit.")
                 else:
-                    result = fit_K_tau_with_a(t_raw - t0, y_fit_data, a=float(a), fit_y0=bool(fit_y0))
+                    result = fit_K_tau_with_a(t_fit - t0, y_fit_data, a=float(a), fit_y0=bool(fit_y0))
                     # For plotting, reconstruct prediction on original time axis by shifting t to start at t0
                     yhat = result["y_fit"]
-                    ax.plot(t_raw, yhat, linewidth=2, label="Fit (K, τ with a)")
+                    ax.plot(t_fit, yhat, linewidth=2, label="Fit (K, τ with a)")
 
             ax.legend()
             st.pyplot(fig, clear_figure=True)
@@ -1133,14 +1181,50 @@ if fit_btn:
     # Re-run same logic (so result exists for other tabs)
     try:
         if model == "Fit Ka & τ (board style)":
-            st.session_state["last_result"] = fit_Ka_tau(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+            rr = fit_Ka_tau(t_fit, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+            y_full = np.full_like(t_raw, np.nan, dtype=float)
+            r_full = np.full_like(t_raw, np.nan, dtype=float)
+            y_full[fit_mask] = rr["y_fit"]
+            r_full[fit_mask] = rr["residuals"]
+            rr["y_fit_full"] = y_full
+            rr["residuals_full"] = r_full
+            rr["n_raw"] = int(len(t_raw))
+            rr["t_on"] = float(t_on_std)
+            rr["t_off"] = float(t_off_std)
+            rr["split_used"] = bool(std_auto_split)
+            rr["segment"] = std_segment_choice if std_auto_split else "Full"
+            st.session_state["last_result"] = rr
             st.session_state["last_model"] = "Ka"
         elif model == "Fit 2nd-order Ka, τ1, τ2":
-            st.session_state["last_result"] = fit_Ka_tau2(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+            rr = fit_Ka_tau2(t_fit, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+            y_full = np.full_like(t_raw, np.nan, dtype=float)
+            r_full = np.full_like(t_raw, np.nan, dtype=float)
+            y_full[fit_mask] = rr["y_fit"]
+            r_full[fit_mask] = rr["residuals"]
+            rr["y_fit_full"] = y_full
+            rr["residuals_full"] = r_full
+            rr["n_raw"] = int(len(t_raw))
+            rr["t_on"] = float(t_on_std)
+            rr["t_off"] = float(t_off_std)
+            rr["split_used"] = bool(std_auto_split)
+            rr["segment"] = std_segment_choice if std_auto_split else "Full"
+            st.session_state["last_result"] = rr
             st.session_state["last_model"] = "Ka2"
         else:
             if fit_K_tau_with_a is not None:
-                st.session_state["last_result"] = fit_K_tau_with_a(t_raw - t0, y_fit_data, a=float(a), fit_y0=bool(fit_y0))
+                rr = fit_K_tau_with_a(t_fit - t0, y_fit_data, a=float(a), fit_y0=bool(fit_y0))
+                y_full = np.full_like(t_raw, np.nan, dtype=float)
+                r_full = np.full_like(t_raw, np.nan, dtype=float)
+                y_full[fit_mask] = rr["y_fit"]
+                r_full[fit_mask] = rr["residuals"]
+                rr["y_fit_full"] = y_full
+                rr["residuals_full"] = r_full
+                rr["n_raw"] = int(len(t_raw))
+                rr["t_on"] = float(t_on_std)
+                rr["t_off"] = float(t_off_std)
+                rr["split_used"] = bool(std_auto_split)
+                rr["segment"] = std_segment_choice if std_auto_split else "Full"
+                st.session_state["last_result"] = rr
                 st.session_state["last_model"] = "K"
     except Exception:
         pass
@@ -1151,8 +1235,8 @@ stale_result_msg = None
 
 # Guard against stale session-state fits from a previous dataset/selection.
 if result is not None:
-    y_fit_cached = np.asarray(result.get("y_fit", []))
-    if y_fit_cached.shape[0] != t_raw.shape[0]:
+    n_cached = int(result.get("n_raw", len(result.get("y_fit_full", []))))
+    if n_cached != t_raw.shape[0]:
         st.session_state["last_result"] = None
         st.session_state["last_model"] = None
         result = None
@@ -1188,7 +1272,14 @@ with tabs[1]:
             )
             st.write(f"**SSE** = {result['SSE']:.6g}   |   **R²** = {result['R2']:.6g}")
 
-        st.caption(f"Using t₀ = {t0:g}  |  Fit used {'smoothed' if use_smoothed_for_fit else 'raw'} y")
+        seg = result.get("segment", "Full")
+        split_txt = f"split {seg.lower()} segment" if result.get("split_used", False) else "full dataset"
+        st.caption(
+            f"Using t₀ = {t0:g}  |  Fit used {'smoothed' if use_smoothed_for_fit else 'raw'} y  |  "
+            f"Data region: {split_txt}"
+        )
+        if result.get("split_used", False):
+            st.caption(f"Detected/used ON = {result.get('t_on', float('nan')):.6g} s, OFF = {result.get('t_off', float('nan')):.6g} s")
 
 # ----------------- Download tab -----------------
 with tabs[2]:
@@ -1208,26 +1299,26 @@ with tabs[2]:
         })
 
         if mode_key == "Ka":
-            out["y_fit"] = result["y_fit"]
-            out["residual"] = result["residuals"]
+            out["y_fit"] = result.get("y_fit_full", result["y_fit"])
+            out["residual"] = result.get("residuals_full", result["residuals"])
             summary = pd.DataFrame({
-                "parameter": ["model", "t0", "Ka", "tau", "y0", "SSE", "R2", "smoothed_fit"],
-                "value": ["Ka_tau", t0, result["Ka"], result["tau"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit],
+                "parameter": ["model", "t0", "Ka", "tau", "y0", "SSE", "R2", "smoothed_fit", "split_used", "segment", "t_on", "t_off"],
+                "value": ["Ka_tau", t0, result["Ka"], result["tau"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit, result.get("split_used", False), result.get("segment", "Full"), result.get("t_on", np.nan), result.get("t_off", np.nan)],
             })
         elif mode_key == "Ka2":
-            out["y_fit"] = result["y_fit"]
-            out["residual"] = result["residuals"]
+            out["y_fit"] = result.get("y_fit_full", result["y_fit"])
+            out["residual"] = result.get("residuals_full", result["residuals"])
             summary = pd.DataFrame({
-                "parameter": ["model", "t0", "Ka", "tau1", "tau2", "y0", "SSE", "R2", "smoothed_fit"],
-                "value": ["Ka_tau1_tau2", t0, result["Ka"], result["tau1"], result["tau2"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit],
+                "parameter": ["model", "t0", "Ka", "tau1", "tau2", "y0", "SSE", "R2", "smoothed_fit", "split_used", "segment", "t_on", "t_off"],
+                "value": ["Ka_tau1_tau2", t0, result["Ka"], result["tau1"], result["tau2"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit, result.get("split_used", False), result.get("segment", "Full"), result.get("t_on", np.nan), result.get("t_off", np.nan)],
             })
         else:
             # result["y_fit"] corresponds to (t - t0) fit, but we used same t grid so it matches
-            out["y_fit"] = result["y_fit"]
-            out["residual"] = result["residuals"]
+            out["y_fit"] = result.get("y_fit_full", result["y_fit"])
+            out["residual"] = result.get("residuals_full", result["residuals"])
             summary = pd.DataFrame({
-                "parameter": ["model", "t0", "a", "K", "tau", "y0", "SSE", "R2", "smoothed_fit"],
-                "value": ["K_tau_with_a", t0, a, result["K"], result["tau"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit],
+                "parameter": ["model", "t0", "a", "K", "tau", "y0", "SSE", "R2", "smoothed_fit", "split_used", "segment", "t_on", "t_off"],
+                "value": ["K_tau_with_a", t0, a, result["K"], result["tau"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit, result.get("split_used", False), result.get("segment", "Full"), result.get("t_on", np.nan), result.get("t_off", np.nan)],
             })
 
         xlsx_bytes = make_excel_bytes(out, summary)
