@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from scipy.optimize import minimize
 from scipy.optimize import curve_fit
+from scipy.optimize import least_squares
 
 # Import whichever fitters you created
 # 1) Ka models
@@ -216,28 +217,60 @@ def fit_full_model_global(run_rows):
 
     kp0 = float(np.nanmedian(kp_guess_list)) if kp_guess_list else 0.1
     tau0 = float(np.nanmedian(tau_guess_list)) if tau_guess_list else 30.0
+    dt_list = []
+    for rr in run_rows:
+        dt_rr = np.diff(rr["t"])
+        dt_rr = dt_rr[np.isfinite(dt_rr) & (dt_rr > 0)]
+        if dt_rr.size:
+            dt_list.append(np.median(dt_rr))
+    tau_min = max(1e-6, 0.05 * float(np.median(dt_list))) if dt_list else 1e-6
 
     def sse_obj(p):
         kp, tau = float(p[0]), float(p[1])
-        if tau <= 0:
+        if tau <= tau_min or not np.isfinite(kp) or not np.isfinite(tau):
             return 1e30
         sse = 0.0
         for rr in run_rows:
             pred = simulate_first_order_deviation(rr["t"], rr["u"], kp, tau, rr["T_dev"][0])
+            if not np.all(np.isfinite(pred)):
+                return 1e30
             err = rr["T_dev"] - pred
-            sse += float(np.sum(err ** 2))
+            sse_i = float(np.sum(err ** 2))
+            if not np.isfinite(sse_i):
+                return 1e30
+            sse += sse_i
         return sse
+
+    def resid_vec(p):
+        kp, tau = float(p[0]), float(p[1])
+        if tau <= tau_min or not np.isfinite(kp) or not np.isfinite(tau):
+            return np.full(sum(len(rr["t"]) for rr in run_rows), 1e12, dtype=float)
+        out = []
+        for rr in run_rows:
+            pred = simulate_first_order_deviation(rr["t"], rr["u"], kp, tau, rr["T_dev"][0])
+            if not np.all(np.isfinite(pred)):
+                return np.full(sum(len(r["t"]) for r in run_rows), 1e12, dtype=float)
+            out.append(rr["T_dev"] - pred)
+        return np.concatenate(out)
 
     opt = minimize(
         sse_obj,
         x0=np.array([kp0, tau0], dtype=float),
         method="L-BFGS-B",
-        bounds=[(None, None), (1e-9, None)],
+        bounds=[(None, None), (tau_min, 1e8)],
     )
-    if not opt.success:
-        raise ValueError(f"Optimization failed: {opt.message}")
-
-    kp_hat, tau_hat = map(float, opt.x)
+    if opt.success and np.all(np.isfinite(opt.x)):
+        kp_hat, tau_hat = map(float, opt.x)
+    else:
+        lsq = least_squares(
+            resid_vec,
+            x0=np.array([kp0, tau0], dtype=float),
+            bounds=([-np.inf, tau_min], [np.inf, 1e8]),
+            max_nfev=20000,
+        )
+        if not lsq.success or not np.all(np.isfinite(lsq.x)):
+            raise ValueError(f"Optimization failed: {opt.message}")
+        kp_hat, tau_hat = map(float, lsq.x)
 
     all_y, all_yhat, per_run = [], [], []
     for rr in run_rows:
