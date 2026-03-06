@@ -199,8 +199,7 @@ def simulate_first_order_deviation(t: np.ndarray, u: np.ndarray, Kp: float, tau:
 
     for i in range(1, len(t)):
         dt_i = float(max(t[i] - t[i - 1], 1e-9))
-        a = np.exp(-dt_i / tau)
-        x[i] = x[i - 1] * a + float(Kp) * float(u[i - 1]) * (1.0 - a)
+        x[i] = x[i - 1] + dt_i * ((-x[i - 1] + float(Kp) * float(u[i - 1])) / tau)
 
     return x
 
@@ -275,10 +274,10 @@ def fit_full_model_global(run_rows):
 
 # ----------------- Streamlit UI -----------------
 st.set_page_config(page_title="Process Fit Tool", layout="wide")
-FULL_MODEL_LABEL = "Fit full model (single from full on/off data)"
+FULL_MODEL_LABEL = "Full ON/OFF model (CHEG 330 Part D)"
 
 st.title("Process Fit (Smooth GUI)")
-st.caption("Upload Excel → pick model → fit → visualize → download results")
+st.caption("Upload CSV/Excel → pick model → fit → visualize → download results")
 
 # Sidebar controls (smooth UX)
 with st.sidebar:
@@ -297,7 +296,10 @@ with st.sidebar:
 
     full_mode = model == FULL_MODEL_LABEL
 
-    fit_y0 = st.checkbox("Fit baseline y₀", value=True)
+    if not full_mode:
+        fit_y0 = st.checkbox("Fit baseline y₀", value=True)
+    else:
+        fit_y0 = True
 
     st.divider()
     if not full_mode:
@@ -313,11 +315,11 @@ with st.sidebar:
         t0_manual = 0.0
 
         st.subheader("Full-model input")
-        u_on = st.number_input("Heater ON level U_on (%)", value=100.0, step=1.0)
+        u_on = st.number_input("Heater percent while ON", value=100.0, step=1.0)
         base_window_sec = st.number_input("Baseline window before ON (s)", value=30.0, step=1.0, min_value=1.0)
-        override_on_off = st.checkbox("Override detected ON/OFF times", value=False)
-        on_manual = st.number_input("Manual ON time (s)", value=0.0, step=1.0)
-        off_manual = st.number_input("Manual OFF time (s)", value=60.0, step=1.0)
+        auto_detect_on_off = st.checkbox("Auto-detect ON/OFF from data derivative", value=True)
+        on_manual = st.number_input("Heater ON time (s)", value=0.0, step=1.0)
+        off_manual = st.number_input("Heater OFF time (s)", value=60.0, step=1.0)
 
     st.divider()
     st.subheader("Noise handling")
@@ -377,10 +379,186 @@ col1, col2, col3 = st.columns([1, 1, 2], gap="large")
 with col1:
     t_col = st.selectbox("Time column", options=list(df.columns), index=0)
 with col2:
-    y_col = st.selectbox("Output column", options=list(df.columns), index=1)
+    y_col = st.selectbox("Tank temperature column", options=list(df.columns), index=1)
+
+extra_preview_cols = []
+if full_mode:
+    c4, c5 = st.columns(2)
+    with c4:
+        cool_in_col = st.selectbox("Coolant-in column (optional)", options=["(none)"] + list(df.columns), index=0)
+    with c5:
+        cool_out_col = st.selectbox("Coolant-out column (optional)", options=["(none)"] + list(df.columns), index=0)
+    extra_preview_cols = [c for c in [cool_in_col, cool_out_col] if c != "(none)"]
+else:
+    cool_in_col = "(none)"
+    cool_out_col = "(none)"
+
 with col3:
     st.write("Preview (first 10 rows):")
-    st.dataframe(df[[t_col, y_col]].head(10), use_container_width=True)
+    preview_cols = [t_col, y_col] + [c for c in extra_preview_cols if c not in [t_col, y_col]]
+    st.dataframe(df[preview_cols].head(10), use_container_width=True)
+
+if full_mode:
+    try:
+        t_all = parse_time_to_elapsed_seconds(df[t_col])
+    except Exception as e:
+        st.error(f"Time parsing failed: {e}")
+        st.stop()
+
+    T_all = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(t_all) & np.isfinite(T_all)
+    t_full = t_all[mask]
+    T_full = T_all[mask]
+
+    if t_full.size < 6:
+        st.error("Need at least 6 valid time/temperature points for Full ON/OFF model.")
+        st.stop()
+
+    order = np.argsort(t_full)
+    t_full = t_full[order]
+    T_full = T_full[order]
+
+    if auto_detect_on_off:
+        t_on_det, t_off_det, T_med, dTdt = detect_on_off_times(t_full, T_full, smooth_window=smooth_window)
+        t_on = float(t_on_det)
+        t_off = float(t_off_det)
+    else:
+        t_on = float(on_manual)
+        t_off = float(off_manual)
+        T_med = rolling_median(T_full, smooth_window)
+        dTdt = np.gradient(T_med, t_full)
+
+    if t_off <= t_on:
+        st.error("Heater OFF time must be greater than heater ON time.")
+        st.stop()
+
+    base_mask = (t_full >= (t_on - float(base_window_sec))) & (t_full < t_on)
+    if np.sum(base_mask) < 3:
+        base_mask = t_full < t_on
+    if np.sum(base_mask) < 3:
+        n0 = max(3, int(0.1 * len(T_full)))
+        base_mask = np.zeros(len(T_full), dtype=bool)
+        base_mask[:n0] = True
+
+    T_base = float(np.mean(T_full[base_mask]))
+    T_dev = T_full - T_base
+    u_full = build_input_profile(t_full, t_on=t_on, t_off=t_off, u_on=u_on)
+
+    run_rows = [{
+        "run": "all",
+        "t": t_full,
+        "T": T_full,
+        "T_dev": T_dev,
+        "u": u_full,
+        "u_on": float(u_on),
+        "t_on": t_on,
+        "t_off": t_off,
+        "T_base": T_base,
+    }]
+
+    if fit_btn:
+        try:
+            fit_full = fit_full_model_global(run_rows)
+            pred_T = fit_full["per_run"][0]["pred_T"]
+            resid = fit_full["per_run"][0]["residual"]
+            st.session_state["full_last_result"] = {
+                "t": t_full,
+                "T": T_full,
+                "u": u_full,
+                "T_base": T_base,
+                "t_on": t_on,
+                "t_off": t_off,
+                "Kp": fit_full["Kp"],
+                "tau": fit_full["tau"],
+                "R2": fit_full["R2"],
+                "SSE": fit_full["SSE"],
+                "T_pred": pred_T,
+                "residual": resid,
+            }
+        except Exception as e:
+            st.error(f"Fit failed: {e}")
+
+    full_result = st.session_state.get("full_last_result", None)
+    if full_result is not None and len(full_result.get("t", [])) != len(t_full):
+        st.session_state["full_last_result"] = None
+        full_result = None
+
+    tabs = st.tabs(["Plot", "Results", "Download / Export"])
+
+    with tabs[0]:
+        st.subheader("Measured vs Full ON/OFF Model")
+        fig, ax1 = plt.subplots()
+        ax1.plot(t_full, T_full, label="Measured tank T", linewidth=1.8)
+        if full_result is not None:
+            ax1.plot(t_full, full_result["T_pred"], label="Model-predicted T", linewidth=2.2)
+        ax1.axvline(t_on, linestyle="--", label=f"ON @ {t_on:.2f}s")
+        ax1.axvline(t_off, linestyle="--", label=f"OFF @ {t_off:.2f}s")
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Tank temperature")
+        ax1.grid(True)
+
+        ax2 = ax1.twinx()
+        ax2.plot(t_full, u_full, color="tab:orange", alpha=0.6, label="Heater input u(t) [%]")
+        ax2.set_ylabel("Heater input (%)")
+
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc="best")
+        st.pyplot(fig, clear_figure=True)
+
+    with tabs[1]:
+        st.subheader("Fit Results")
+        if full_result is None:
+            st.info("Click **Fit model** to estimate Kp and tau for the full ON/OFF dataset.")
+        else:
+            st.write(
+                f"**Kp** = {full_result['Kp']:.6g} °C/%   |   **tau** = {full_result['tau']:.6g} s   |   "
+                f"**R²** = {full_result['R2']:.6g}"
+            )
+            st.write(
+                f"**Detected/used ON time** = {full_result['t_on']:.6g} s   |   "
+                f"**Detected/used OFF time** = {full_result['t_off']:.6g} s"
+            )
+            st.caption(f"Baseline temperature T_base = {full_result['T_base']:.6g}")
+
+    with tabs[2]:
+        st.subheader("Download / Export")
+        if full_result is None:
+            st.info("Fit first, then download CSV/text outputs.")
+        else:
+            out = pd.DataFrame({
+                "time_s": t_full,
+                "tank_temp_meas": T_full,
+                "heater_u_percent": u_full,
+                "tank_temp_pred": full_result["T_pred"],
+                "residual": full_result["residual"],
+            })
+            csv_bytes = out.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download results CSV",
+                data=csv_bytes,
+                file_name="full_on_off_fit_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            model_text = (
+                f"G(s) = {full_result['Kp']:.6g} / ({full_result['tau']:.6g} s + 1)\n"
+                f"Equivalent form: G(s) = Kp / (tau s + 1), with Kp = {full_result['Kp']:.6g}, tau = {full_result['tau']:.6g} s.\n\n"
+                "A single first-order model is reasonable because the same tank dynamics govern both heating and cooling. "
+                "The heater ON/OFF profile is handled through the input u(t), while Kp and tau remain constant system properties. "
+                "The full-dataset fit captures both transients with one parameter set and provides a consistent R² measure."
+            )
+            st.text_area("Model summary text", value=model_text, height=170)
+            st.download_button(
+                "⬇️ Download model text",
+                data=model_text,
+                file_name="full_on_off_model_summary.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+    st.stop()
 
 t_raw = df[t_col].to_numpy()
 y_raw = df[y_col].to_numpy()
