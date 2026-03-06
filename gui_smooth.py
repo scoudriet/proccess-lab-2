@@ -1,8 +1,10 @@
 import io
+import datetime as dt
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+from scipy.optimize import minimize
 
 # Import whichever fitters you created
 # 1) Ka models
@@ -57,8 +59,223 @@ def make_excel_bytes(data_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def parse_time_to_elapsed_seconds(time_series: pd.Series) -> np.ndarray:
+    """
+    Parse mixed time formats into elapsed seconds starting at 0.
+    Supports:
+      - Excel time-of-day values
+      - elapsed strings like 00:01 / 00:06 / 00:00:30
+      - datetime-like values
+      - numeric values (seconds or Excel day-fractions)
+    """
+    s = pd.Series(time_series)
+    out = np.full(len(s), np.nan, dtype=float)
+    saw_clock_time = False
+
+    for i, v in enumerate(s):
+        if pd.isna(v):
+            continue
+
+        if isinstance(v, pd.Timedelta):
+            out[i] = float(v.total_seconds())
+            continue
+        if isinstance(v, dt.timedelta):
+            out[i] = float(v.total_seconds())
+            continue
+        if isinstance(v, dt.time):
+            saw_clock_time = True
+            out[i] = float(v.hour * 3600 + v.minute * 60 + v.second + v.microsecond / 1e6)
+            continue
+        if isinstance(v, pd.Timestamp):
+            out[i] = float(v.timestamp())
+            continue
+        if isinstance(v, dt.datetime):
+            out[i] = float(v.timestamp())
+            continue
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            out[i] = float(v)
+            continue
+
+        txt = str(v).strip()
+        if not txt:
+            continue
+
+        td = pd.to_timedelta(txt, errors="coerce")
+        if pd.notna(td):
+            out[i] = float(td.total_seconds())
+            continue
+
+        parsed = False
+        for fmt in ["%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"]:
+            try:
+                tval = dt.datetime.strptime(txt, fmt).time()
+                saw_clock_time = True
+                out[i] = float(tval.hour * 3600 + tval.minute * 60 + tval.second)
+                parsed = True
+                break
+            except ValueError:
+                continue
+        if parsed:
+            continue
+
+        dval = pd.to_datetime(txt, errors="coerce")
+        if pd.notna(dval):
+            out[i] = float(pd.Timestamp(dval).timestamp())
+
+    if np.isfinite(out).sum() < 2:
+        raise ValueError("Could not parse time column into elapsed seconds.")
+
+    # Excel often stores time-of-day as fraction of one day.
+    if pd.api.types.is_numeric_dtype(s):
+        finite = out[np.isfinite(out)]
+        if finite.size and np.nanmax(np.abs(finite)) <= 2.0:
+            out = out * 86400.0
+            saw_clock_time = True
+
+    # Unwrap midnight rollover for clock-style values.
+    if saw_clock_time:
+        shift = 0.0
+        prev = None
+        for i in range(len(out)):
+            if not np.isfinite(out[i]):
+                continue
+            cur = out[i] + shift
+            if prev is not None and cur < (prev - 43200.0):
+                shift += 86400.0
+                cur = out[i] + shift
+            out[i] = cur
+            prev = cur
+
+    first = out[np.isfinite(out)][0]
+    out = out - first
+    return out
+
+
+def rolling_median(y: np.ndarray, window: int) -> np.ndarray:
+    w = int(max(3, window))
+    if w % 2 == 0:
+        w += 1
+    return pd.Series(y).rolling(window=w, center=True, min_periods=1).median().to_numpy(dtype=float)
+
+
+def detect_on_off_times(t: np.ndarray, y: np.ndarray, smooth_window: int = 11, edge_frac: float = 0.05):
+    t, y = clean_sort_xy(t, y)
+    ys = rolling_median(y, smooth_window)
+    dy = np.gradient(ys, t)
+
+    n = len(t)
+    edge = max(2, int(edge_frac * n))
+    lo, hi = edge, max(edge + 3, n - edge)
+    if hi <= lo:
+        lo, hi = 1, n - 1
+
+    on_idx = lo + int(np.argmax(dy[lo:hi]))
+    min_gap = max(3, int(0.05 * n))
+    off_start = min(n - 2, on_idx + min_gap)
+    if off_start >= hi:
+        off_start = min(n - 2, on_idx + 1)
+
+    if off_start < hi:
+        off_idx = off_start + int(np.argmin(dy[off_start:hi]))
+    else:
+        off_idx = n - 1
+
+    if off_idx <= on_idx:
+        off_idx = min(n - 1, on_idx + 1)
+
+    return float(t[on_idx]), float(t[off_idx]), ys, dy
+
+
+def build_input_profile(t: np.ndarray, t_on: float, t_off: float, u_on: float) -> np.ndarray:
+    u = np.zeros_like(t, dtype=float)
+    u[(t >= float(t_on)) & (t < float(t_off))] = float(u_on)
+    return u
+
+
+def simulate_first_order_deviation(t: np.ndarray, u: np.ndarray, Kp: float, tau: float, x0: float) -> np.ndarray:
+    tau = float(max(tau, 1e-9))
+    x = np.zeros_like(t, dtype=float)
+    x[0] = float(x0)
+
+    for i in range(1, len(t)):
+        dt_i = float(max(t[i] - t[i - 1], 1e-9))
+        a = np.exp(-dt_i / tau)
+        x[i] = x[i - 1] * a + float(Kp) * float(u[i - 1]) * (1.0 - a)
+
+    return x
+
+
+def fit_full_model_global(run_rows):
+    # Initial guess from observed change and ON-level.
+    kp_guess_list, tau_guess_list = [], []
+    for rr in run_rows:
+        u_on = max(abs(rr["u_on"]), 1e-9)
+        kp_guess_list.append((np.nanmax(rr["T_dev"]) - np.nanmin(rr["T_dev"])) / u_on)
+        tau_guess_list.append(max(1.0, 0.5 * max(rr["t_off"] - rr["t_on"], 1.0)))
+
+    kp0 = float(np.nanmedian(kp_guess_list)) if kp_guess_list else 0.1
+    tau0 = float(np.nanmedian(tau_guess_list)) if tau_guess_list else 30.0
+
+    def sse_obj(p):
+        kp, tau = float(p[0]), float(p[1])
+        if tau <= 0:
+            return 1e30
+        sse = 0.0
+        for rr in run_rows:
+            pred = simulate_first_order_deviation(rr["t"], rr["u"], kp, tau, rr["T_dev"][0])
+            err = rr["T_dev"] - pred
+            sse += float(np.sum(err ** 2))
+        return sse
+
+    opt = minimize(
+        sse_obj,
+        x0=np.array([kp0, tau0], dtype=float),
+        method="L-BFGS-B",
+        bounds=[(None, None), (1e-9, None)],
+    )
+    if not opt.success:
+        raise ValueError(f"Optimization failed: {opt.message}")
+
+    kp_hat, tau_hat = map(float, opt.x)
+
+    all_y, all_yhat, per_run = [], [], []
+    for rr in run_rows:
+        pred_dev = simulate_first_order_deviation(rr["t"], rr["u"], kp_hat, tau_hat, rr["T_dev"][0])
+        pred_T = rr["T_base"] + pred_dev
+        resid = rr["T"] - pred_T
+        sse = float(np.sum(resid ** 2))
+        sst = float(np.sum((rr["T"] - np.mean(rr["T"])) ** 2))
+        r2 = float(1.0 - sse / sst) if sst > 0 else float("nan")
+        per_run.append({
+            "run": rr["run"],
+            "R2": r2,
+            "t_on": rr["t_on"],
+            "t_off": rr["t_off"],
+            "T_base": rr["T_base"],
+            "pred_T": pred_T,
+            "residual": resid,
+        })
+        all_y.append(rr["T"])
+        all_yhat.append(pred_T)
+
+    y_all = np.concatenate(all_y)
+    yhat_all = np.concatenate(all_yhat)
+    sse_all = float(np.sum((y_all - yhat_all) ** 2))
+    sst_all = float(np.sum((y_all - np.mean(y_all)) ** 2))
+    r2_all = float(1.0 - sse_all / sst_all) if sst_all > 0 else float("nan")
+
+    return {
+        "Kp": kp_hat,
+        "tau": tau_hat,
+        "SSE": sse_all,
+        "R2": r2_all,
+        "per_run": per_run,
+    }
+
+
 # ----------------- Streamlit UI -----------------
 st.set_page_config(page_title="Process Fit Tool", layout="wide")
+FULL_MODEL_LABEL = "Fit full model (single from full on/off data)"
 
 st.title("Process Fit (Smooth GUI)")
 st.caption("Upload Excel → pick model → fit → visualize → download results")
@@ -72,28 +289,42 @@ with st.sidebar:
         [
             "Fit Ka & τ (board style)",
             "Fit K & τ (you enter step size a)",
-            "Fit 2nd-order Ka, τ1, τ2"
+            "Fit 2nd-order Ka, τ1, τ2",
+            FULL_MODEL_LABEL,
         ],
-        help="Ka model treats K·a as one parameter (prof example). K model separates K using your step size a. Second-order model fits two real time constants."
+        help="Ka model treats K·a as one parameter (prof example). K model separates K using your step size a. Second-order model fits two real time constants. Full model fits one Kp/tau across full ON/OFF data."
     )
+
+    full_mode = model == FULL_MODEL_LABEL
 
     fit_y0 = st.checkbox("Fit baseline y₀", value=True)
 
     st.divider()
-    st.subheader("Step timing")
-    step_mode = st.radio(
-        "Step time t₀",
-        ["Assume t₀ = 0", "Enter t₀ manually", "Auto-detect t₀ from data"],
-        index=0
-    )
-    t0_manual = st.number_input("t₀ (if manual)", value=0.0, step=0.1)
+    if not full_mode:
+        st.subheader("Step timing")
+        step_mode = st.radio(
+            "Step time t₀",
+            ["Assume t₀ = 0", "Enter t₀ manually", "Auto-detect t₀ from data"],
+            index=0
+        )
+        t0_manual = st.number_input("t₀ (if manual)", value=0.0, step=0.1)
+    else:
+        step_mode = "Auto-detect t₀ from data"
+        t0_manual = 0.0
+
+        st.subheader("Full-model input")
+        u_on = st.number_input("Heater ON level U_on (%)", value=100.0, step=1.0)
+        base_window_sec = st.number_input("Baseline window before ON (s)", value=30.0, step=1.0, min_value=1.0)
+        override_on_off = st.checkbox("Override detected ON/OFF times", value=False)
+        on_manual = st.number_input("Manual ON time (s)", value=0.0, step=1.0)
+        off_manual = st.number_input("Manual OFF time (s)", value=60.0, step=1.0)
 
     st.divider()
     st.subheader("Noise handling")
     smooth_window = st.slider(
-        "Smoothing window (for display / optional guessing)",
+        "Smoothing window (display / detection)",
         min_value=1, max_value=21, value=5, step=2,
-        help="Higher smooths choppy data more. Does not change the raw-fit unless you enable it below."
+        help="Higher smooths choppy data more. Full-model step detection uses rolling median with this window."
     )
     use_smoothed_for_fit = st.checkbox(
         "Use smoothed y for fitting (optional)",
@@ -102,7 +333,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Excel input")
+    st.subheader("File input")
     sheet = st.text_input("Sheet name (blank = first sheet)", value="")
     header = st.checkbox("First row is header", value=True)
 
@@ -116,21 +347,25 @@ with st.sidebar:
 
 
 # Main: upload + preview + results
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader("Upload data (.csv or .xlsx)", type=["csv", "xlsx"])
 
 if uploaded is None:
-    st.info("Upload an Excel file to begin.")
+    st.info("Upload a CSV or Excel file to begin.")
     st.stop()
 
-# Read Excel
+# Read file
 try:
-    df = pd.read_excel(
-        uploaded,
-        sheet_name=sheet.strip() if sheet.strip() else 0,
-        header=0 if header else None
-    )
+    name = uploaded.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded, header=0 if header else None)
+    else:
+        df = pd.read_excel(
+            uploaded,
+            sheet_name=sheet.strip() if sheet.strip() else 0,
+            header=0 if header else None,
+        )
 except Exception as e:
-    st.error(f"Could not read Excel: {e}")
+    st.error(f"Could not read file: {e}")
     st.stop()
 
 if df.shape[1] < 2:
@@ -233,10 +468,24 @@ if fit_btn:
 
 result = st.session_state.get("last_result", None)
 mode_key = st.session_state.get("last_model", None)
+stale_result_msg = None
+
+# Guard against stale session-state fits from a previous dataset/selection.
+if result is not None:
+    y_fit_cached = np.asarray(result.get("y_fit", []))
+    if y_fit_cached.shape[0] != t_raw.shape[0]:
+        st.session_state["last_result"] = None
+        st.session_state["last_model"] = None
+        result = None
+        mode_key = None
+        stale_result_msg = "Cached fit does not match current data length. Click **Fit model** again."
 
 # ----------------- Results tab -----------------
 with tabs[1]:
     st.subheader("Fit Results")
+
+    if stale_result_msg:
+        st.warning(stale_result_msg)
 
     if result is None:
         st.info("Click **Fit model** in the sidebar to compute parameters.")
@@ -265,6 +514,9 @@ with tabs[1]:
 # ----------------- Download tab -----------------
 with tabs[2]:
     st.subheader("Download / Export")
+
+    if stale_result_msg:
+        st.warning(stale_result_msg)
 
     if result is None:
         st.info("Fit first, then you can download the fitted Excel.")
