@@ -133,3 +133,96 @@ def fit_first_order(t, y, t0=0.0, fit_y0=True):
         "tau0": tau0,
         "y0_guess": y0_guess,
     }
+
+
+def second_order_response(t, Ka, tau1, tau2, y0=0.0, t0=0.0):
+    """
+    Second-order step response for two real poles:
+
+      G(s) = Ka / ((tau1*s + 1)(tau2*s + 1))
+
+    with step at t0 and baseline y0.
+    """
+    t = np.asarray(t, dtype=float)
+    ts = np.maximum(t - t0, 0.0)
+
+    tau1 = float(max(tau1, 1e-12))
+    tau2 = float(max(tau2, 1e-12))
+
+    # Numerically-stable branch when time constants are nearly equal.
+    if abs(tau1 - tau2) <= 1e-8 * max(tau1, tau2):
+        tau = 0.5 * (tau1 + tau2)
+        shape = 1.0 - np.exp(-ts / tau) * (1.0 + ts / tau)
+    else:
+        shape = 1.0 - (
+            tau1 * np.exp(-ts / tau1) - tau2 * np.exp(-ts / tau2)
+        ) / (tau1 - tau2)
+
+    return y0 + Ka * shape
+
+
+def fit_second_order(t, y, t0=0.0, fit_y0=True):
+    """
+    Fit Ka, tau1, tau2 (and optionally y0) to second-order step response.
+    """
+    t, y = _clean_sort(t, y)
+    if t.size < 6:
+        raise ValueError("Need at least 6 valid points to fit second-order model.")
+
+    Ka0, tau0, y0_guess = _initial_guesses(t, y, float(t0))
+    tau1_0 = max(0.5 * tau0, 1e-6)
+    tau2_0 = max(2.0 * tau0, 2e-6)
+
+    if fit_y0:
+        popt, _ = curve_fit(
+            lambda tt, Ka, tau1, tau2, y0: second_order_response(
+                tt, Ka, tau1, tau2, y0=y0, t0=float(t0)
+            ),
+            t,
+            y,
+            p0=[Ka0, tau1_0, tau2_0, y0_guess],
+            bounds=([-np.inf, 1e-9, 1e-9, -np.inf], [np.inf, np.inf, np.inf, np.inf]),
+            maxfev=50000,
+        )
+        Ka_hat, tau1_hat, tau2_hat, y0_hat = map(float, popt)
+    else:
+        popt, _ = curve_fit(
+            lambda tt, Ka, tau1, tau2: second_order_response(
+                tt, Ka, tau1, tau2, y0=y0_guess, t0=float(t0)
+            ),
+            t,
+            y,
+            p0=[Ka0, tau1_0, tau2_0],
+            bounds=([-np.inf, 1e-9, 1e-9], [np.inf, np.inf, np.inf]),
+            maxfev=50000,
+        )
+        Ka_hat, tau1_hat, tau2_hat = map(float, popt)
+        y0_hat = float(y0_guess)
+
+    # Keep tau1 <= tau2 for consistent reporting.
+    tau1_hat, tau2_hat = sorted([max(tau1_hat, 1e-9), max(tau2_hat, 1e-9)])
+
+    y_fit = second_order_response(t, Ka_hat, tau1_hat, tau2_hat, y0=y0_hat, t0=float(t0))
+    residuals = y - y_fit
+
+    SSE = float(np.sum(residuals ** 2))
+    ybar = float(np.mean(y))
+    SStot = float(np.sum((y - ybar) ** 2))
+    R2 = float(1.0 - SSE / SStot) if SStot > 0 else float("nan")
+
+    return {
+        "t": t,
+        "y": y,
+        "Ka": Ka_hat,
+        "tau1": tau1_hat,
+        "tau2": tau2_hat,
+        "y0": y0_hat,
+        "SSE": SSE,
+        "R2": R2,
+        "y_fit": y_fit,
+        "residuals": residuals,
+        "Ka0": Ka0,
+        "tau1_0": tau1_0,
+        "tau2_0": tau2_0,
+        "y0_guess": y0_guess,
+    }

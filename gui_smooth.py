@@ -5,8 +5,11 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 # Import whichever fitters you created
-# 1) Ka model (board style)
-from fit_model import fit_first_order as fit_Ka_tau  # returns keys: Ka, tau, y0, ...
+# 1) Ka models
+from fit_model import (
+    fit_first_order as fit_Ka_tau,      # returns keys: Ka, tau, y0, ...
+    fit_second_order as fit_Ka_tau2,    # returns keys: Ka, tau1, tau2, y0, ...
+)
 
 # 2) K model (with a)
 # If you created the file I sent: fit_model_with_a.py
@@ -55,9 +58,9 @@ def make_excel_bytes(data_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
 
 
 # ----------------- Streamlit UI -----------------
-st.set_page_config(page_title="First-Order Fit Tool", layout="wide")
+st.set_page_config(page_title="Process Fit Tool", layout="wide")
 
-st.title("First-Order Process Fit (Smooth GUI)")
+st.title("Process Fit (Smooth GUI)")
 st.caption("Upload Excel → pick model → fit → visualize → download results")
 
 # Sidebar controls (smooth UX)
@@ -68,9 +71,10 @@ with st.sidebar:
         "Model",
         [
             "Fit Ka & τ (board style)",
-            "Fit K & τ (you enter step size a)"
+            "Fit K & τ (you enter step size a)",
+            "Fit 2nd-order Ka, τ1, τ2"
         ],
-        help="Ka model treats K·a as one parameter (prof example). K model separates K using your step size a."
+        help="Ka model treats K·a as one parameter (prof example). K model separates K using your step size a. Second-order model fits two real time constants."
     )
 
     fit_y0 = st.checkbox("Fit baseline y₀", value=True)
@@ -182,6 +186,9 @@ with tabs[0]:
                 # Ka fitter expects t0 and fit_y0 per the updated fit_model.py
                 result = fit_Ka_tau(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
                 ax.plot(result["t"], result["y_fit"], linewidth=2, label="Fit (Ka, τ)")
+            elif model == "Fit 2nd-order Ka, τ1, τ2":
+                result = fit_Ka_tau2(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+                ax.plot(result["t"], result["y_fit"], linewidth=2, label="Fit (Ka, τ1, τ2)")
             else:
                 if fit_K_tau_with_a is None:
                     st.error("K-with-a model not available. Create fit_model_with_a.py and restart Streamlit.")
@@ -214,6 +221,9 @@ if fit_btn:
         if model == "Fit Ka & τ (board style)":
             st.session_state["last_result"] = fit_Ka_tau(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
             st.session_state["last_model"] = "Ka"
+        elif model == "Fit 2nd-order Ka, τ1, τ2":
+            st.session_state["last_result"] = fit_Ka_tau2(t_raw, y_fit_data, t0=float(t0), fit_y0=bool(fit_y0))
+            st.session_state["last_model"] = "Ka2"
         else:
             if fit_K_tau_with_a is not None:
                 st.session_state["last_result"] = fit_K_tau_with_a(t_raw - t0, y_fit_data, a=float(a), fit_y0=bool(fit_y0))
@@ -235,6 +245,12 @@ with tabs[1]:
             st.write(
                 f"**Ka** = {result['Ka']:.6g}   |   **τ** = {result['tau']:.6g}   |   "
                 f"**y₀** = {result['y0']:.6g}"
+            )
+            st.write(f"**SSE** = {result['SSE']:.6g}   |   **R²** = {result['R2']:.6g}")
+        elif mode_key == "Ka2":
+            st.write(
+                f"**Ka** = {result['Ka']:.6g}   |   **τ1** = {result['tau1']:.6g}   |   "
+                f"**τ2** = {result['tau2']:.6g}   |   **y₀** = {result['y0']:.6g}"
             )
             st.write(f"**SSE** = {result['SSE']:.6g}   |   **R²** = {result['R2']:.6g}")
         else:
@@ -267,6 +283,13 @@ with tabs[2]:
                 "parameter": ["model", "t0", "Ka", "tau", "y0", "SSE", "R2", "smoothed_fit"],
                 "value": ["Ka_tau", t0, result["Ka"], result["tau"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit],
             })
+        elif mode_key == "Ka2":
+            out["y_fit"] = result["y_fit"]
+            out["residual"] = result["residuals"]
+            summary = pd.DataFrame({
+                "parameter": ["model", "t0", "Ka", "tau1", "tau2", "y0", "SSE", "R2", "smoothed_fit"],
+                "value": ["Ka_tau1_tau2", t0, result["Ka"], result["tau1"], result["tau2"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit],
+            })
         else:
             # result["y_fit"] corresponds to (t - t0) fit, but we used same t grid so it matches
             out["y_fit"] = result["y_fit"]
@@ -281,7 +304,7 @@ with tabs[2]:
         st.download_button(
             "⬇️ Download fitted Excel",
             data=xlsx_bytes,
-            file_name="first_order_fit_results.xlsx",
+            file_name="process_fit_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
@@ -293,8 +316,9 @@ with tabs[2]:
 - Make a `y_fit` column using the formula:
   - Ka model: `y0 + Ka*(1-EXP(-t/tau))`
   - K model:  `y0 + K*a*(1-EXP(-t/tau))`
+- 2nd-order model: `y0 + Ka*(1-(tau1*EXP(-t/tau1)-tau2*EXP(-t/tau2))/(tau1-tau2))`
 - Make a residual column: `y - y_fit`
 - SSE cell: `=SUMSQ(residual_range)`
-- Use **Data → Solver**: minimize SSE by changing `Ka` (or `K`) and `tau` (and y0 if fitting it). Constrain `tau > 0`.
+- Use **Data → Solver**: minimize SSE by changing fit parameters (`Ka/K`, `tau` or `tau1/tau2`, and `y0` if fitting it). Constrain all `tau` values > 0.
             """
         )
