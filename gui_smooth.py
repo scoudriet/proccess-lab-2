@@ -283,6 +283,9 @@ st.caption("Upload CSV/Excel → pick model → fit → visualize → download r
 with st.sidebar:
     st.header("Controls")
 
+    if st.button("About"):
+        st.info("Created by Shane Coudriet\nChemical Engineer 2026")
+
     model = st.selectbox(
         "Model",
         [
