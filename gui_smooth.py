@@ -1,10 +1,12 @@
 import io
 import datetime as dt
+import zipfile
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 from scipy.optimize import minimize
+from scipy.optimize import curve_fit
 
 # Import whichever fitters you created
 # 1) Ka models
@@ -272,6 +274,100 @@ def fit_full_model_global(run_rows):
     }
 
 
+def first_order_segment_response(t, K, tau, y0, t0):
+    t = np.asarray(t, dtype=float)
+    ts = np.maximum(t - float(t0), 0.0)
+    return float(y0) + float(K) * (1.0 - np.exp(-ts / max(float(tau), 1e-9)))
+
+
+def fit_first_order_segment(t, y, t0):
+    t, y = clean_sort_xy(t, y)
+    if t.size < 5:
+        raise ValueError("Need at least 5 points for first-order segment fit.")
+
+    y0_0 = float(y[0])
+    y_inf = float(np.mean(y[-max(3, int(0.2 * len(y))):]))
+    K0 = y_inf - y0_0
+    tau0 = max((t[-1] - t[0]) / 3.0, 1e-6)
+
+    popt, _ = curve_fit(
+        lambda tt, K, tau, y0: first_order_segment_response(tt, K, tau, y0, t0=t0),
+        t,
+        y,
+        p0=[K0, tau0, y0_0],
+        bounds=([-np.inf, 1e-9, -np.inf], [np.inf, np.inf, np.inf]),
+        maxfev=40000,
+    )
+    K, tau, y0 = map(float, popt)
+    yhat = first_order_segment_response(t, K, tau, y0, t0=t0)
+    resid = y - yhat
+    sse = float(np.sum(resid ** 2))
+    sst = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = float(1.0 - sse / sst) if sst > 0 else float("nan")
+    return {"t": t, "y": y, "y_fit": yhat, "residuals": resid, "K": K, "tau": tau, "y0": y0, "SSE": sse, "R2": r2}
+
+
+def second_order_segment_response(t, K, tau1, tau2, y0, t0):
+    t = np.asarray(t, dtype=float)
+    ts = np.maximum(t - float(t0), 0.0)
+    tau1 = float(max(tau1, 1e-12))
+    tau2 = float(max(tau2, 1e-12))
+
+    if abs(tau1 - tau2) <= 1e-8 * max(tau1, tau2):
+        tau = 0.5 * (tau1 + tau2)
+        shape = 1.0 - np.exp(-ts / tau) * (1.0 + ts / tau)
+    else:
+        shape = 1.0 - (tau1 * np.exp(-ts / tau1) - tau2 * np.exp(-ts / tau2)) / (tau1 - tau2)
+
+    return float(y0) + float(K) * shape
+
+
+def fit_second_order_segment(t, y, t0):
+    t, y = clean_sort_xy(t, y)
+    if t.size < 7:
+        raise ValueError("Need at least 7 points for second-order segment fit.")
+
+    y0_0 = float(y[0])
+    y_inf = float(np.mean(y[-max(3, int(0.2 * len(y))):]))
+    K0 = y_inf - y0_0
+    tau0 = max((t[-1] - t[0]) / 3.0, 1e-6)
+
+    popt, _ = curve_fit(
+        lambda tt, K, tau1, tau2, y0: second_order_segment_response(tt, K, tau1, tau2, y0, t0=t0),
+        t,
+        y,
+        p0=[K0, 1.5 * tau0, 0.5 * tau0, y0_0],
+        bounds=([-np.inf, 1e-9, 1e-9, -np.inf], [np.inf, np.inf, np.inf, np.inf]),
+        maxfev=60000,
+    )
+    K, tau1, tau2, y0 = map(float, popt)
+    tau_big, tau_small = sorted([max(tau1, 1e-9), max(tau2, 1e-9)], reverse=True)
+    yhat = second_order_segment_response(t, K, tau_big, tau_small, y0, t0=t0)
+    resid = y - yhat
+    sse = float(np.sum(resid ** 2))
+    sst = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = float(1.0 - sse / sst) if sst > 0 else float("nan")
+    return {
+        "t": t,
+        "y": y,
+        "y_fit": yhat,
+        "residuals": resid,
+        "K": K,
+        "tau1": tau_big,
+        "tau2": tau_small,
+        "y0": y0,
+        "SSE": sse,
+        "R2": r2,
+    }
+
+
+def fig_to_png_bytes(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # ----------------- Streamlit UI -----------------
 st.set_page_config(page_title="Process Fit Tool", layout="wide")
 FULL_MODEL_LABEL = "Full ON/OFF model (CHEG 330 Part D)"
@@ -282,6 +378,8 @@ st.caption("Upload CSV/Excel → pick model → fit → visualize → download r
 # Sidebar controls (smooth UX)
 with st.sidebar:
     st.header("Controls")
+
+    cheg_auto_enabled = st.toggle("Enable CHEG 330 Auto Analysis", value=False)
 
     if st.button("About"):
         st.info("Created by Shane Coudriet\nChemical Engineer 2026")
@@ -298,6 +396,29 @@ with st.sidebar:
     )
 
     full_mode = model == FULL_MODEL_LABEL
+
+    if cheg_auto_enabled:
+        st.divider()
+        st.subheader("CHEG 330 Auto")
+        auto_ignore_edge_pct = st.slider("Ignore edges for step detection (%)", min_value=5, max_value=10, value=8, step=1)
+        auto_override_on_off = st.checkbox("Override detected ON/OFF times manually", value=False)
+        auto_on_manual = st.number_input("Manual ON time (s)", value=0.0, step=1.0, key="auto_on_manual")
+        auto_off_manual = st.number_input("Manual OFF time (s)", value=60.0, step=1.0, key="auto_off_manual")
+        auto_base_window_sec = st.number_input("Baseline window before ON (s)", value=30.0, step=1.0, min_value=1.0, key="auto_base_window_sec")
+        auto_default_u_on = st.number_input("Default heater ON percent (%)", value=100.0, step=1.0, key="auto_default_u_on")
+        show_first_order = st.checkbox("Show first-order overlays", value=True)
+        show_second_order = st.checkbox("Show second-order overlays", value=True)
+        show_grouped_onoff = st.checkbox("Show grouped ON/OFF overlay", value=True)
+    else:
+        auto_ignore_edge_pct = 8
+        auto_override_on_off = False
+        auto_on_manual = 0.0
+        auto_off_manual = 60.0
+        auto_base_window_sec = 30.0
+        auto_default_u_on = 100.0
+        show_first_order = True
+        show_second_order = True
+        show_grouped_onoff = True
 
     if not full_mode:
         fit_y0 = st.checkbox("Fit baseline y₀", value=True)
@@ -352,6 +473,383 @@ with st.sidebar:
 
 
 # Main: upload + preview + results
+if cheg_auto_enabled:
+    st.subheader("CHEG 330 Auto Analysis")
+    auto_files = st.file_uploader(
+        "Upload one or more CSV/XLSX files",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+        key="cheg_auto_files",
+    )
+
+    if not auto_files:
+        st.info("Enable CHEG 330 Auto Analysis is ON. Upload at least one file to continue.")
+        st.stop()
+
+    def _read_uploaded_file(up):
+        up.seek(0)
+        n = up.name.lower()
+        if n.endswith(".csv"):
+            return pd.read_csv(up, header=0 if header else None)
+        return pd.read_excel(up, sheet_name=sheet.strip() if sheet.strip() else 0, header=0 if header else None)
+
+    try:
+        df0 = _read_uploaded_file(auto_files[0])
+    except Exception as e:
+        st.error(f"Could not read first file: {e}")
+        st.stop()
+
+    if df0.shape[1] < 2:
+        st.error("Need at least 2 columns in each file: time and tank temperature.")
+        st.stop()
+
+    a1, a2, a3 = st.columns([1, 1, 2], gap="large")
+    with a1:
+        auto_t_col = st.selectbox("Time column", options=list(df0.columns), index=0, key="auto_t_col")
+    with a2:
+        auto_y_col = st.selectbox("Tank temperature column", options=list(df0.columns), index=1, key="auto_y_col")
+    with a3:
+        st.write("Preview (first file, first 10 rows):")
+        st.dataframe(df0[[auto_t_col, auto_y_col]].head(10), use_container_width=True)
+
+    b1, b2 = st.columns(2)
+    with b1:
+        auto_cool_in_col = st.selectbox("Coolant-in column (optional)", options=["(none)"] + list(df0.columns), index=0, key="auto_cool_in_col")
+    with b2:
+        auto_cool_out_col = st.selectbox("Coolant-out column (optional)", options=["(none)"] + list(df0.columns), index=0, key="auto_cool_out_col")
+
+    hp_default = pd.DataFrame({"file": [f.name for f in auto_files], "heater_percent": [float(auto_default_u_on)] * len(auto_files)})
+    hp_editor = st.data_editor(
+        hp_default,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["file"],
+        key="auto_heater_pct_table",
+    )
+    heater_map = {str(r["file"]): float(r["heater_percent"]) for _, r in hp_editor.iterrows()}
+
+    run_auto_btn = st.button("Run CHEG 330 Auto Analysis", type="primary", use_container_width=True)
+    state_key = "cheg_auto_analysis_result"
+
+    if run_auto_btn:
+        analyses = []
+        run_rows = []
+        warnings = []
+
+        for up in auto_files:
+            try:
+                dfi = _read_uploaded_file(up)
+            except Exception as e:
+                warnings.append(f"{up.name}: read failed ({e})")
+                continue
+
+            if auto_t_col not in dfi.columns or auto_y_col not in dfi.columns:
+                warnings.append(f"{up.name}: missing selected time/tank columns.")
+                continue
+
+            try:
+                t_all = parse_time_to_elapsed_seconds(dfi[auto_t_col])
+            except Exception as e:
+                warnings.append(f"{up.name}: time parse failed ({e})")
+                continue
+
+            T_all = pd.to_numeric(dfi[auto_y_col], errors="coerce").to_numpy(dtype=float)
+            m = np.isfinite(t_all) & np.isfinite(T_all)
+            t = t_all[m]
+            T = T_all[m]
+            if t.size < 10:
+                warnings.append(f"{up.name}: not enough valid points.")
+                continue
+
+            idx = np.argsort(t)
+            t = t[idx]
+            T = T[idx]
+
+            if auto_override_on_off:
+                t_on = float(auto_on_manual)
+                t_off = float(auto_off_manual)
+                T_med = rolling_median(T, smooth_window)
+            else:
+                t_on, t_off, T_med, _ = detect_on_off_times(
+                    t,
+                    T,
+                    smooth_window=smooth_window,
+                    edge_frac=float(auto_ignore_edge_pct) / 100.0,
+                )
+
+            if not np.isfinite(t_on) or not np.isfinite(t_off) or t_off <= t_on:
+                warnings.append(f"{up.name}: invalid detected ON/OFF times.")
+                continue
+
+            heat_mask = (t >= t_on) & (t < t_off)
+            cool_mask = t >= t_off
+            if np.sum(heat_mask) < 5 or np.sum(cool_mask) < 5:
+                warnings.append(f"{up.name}: insufficient heating/cooling points after segmentation.")
+                continue
+
+            try:
+                fo_heat = fit_first_order_segment(t[heat_mask], T[heat_mask], t0=t_on)
+            except Exception as e:
+                fo_heat = {"K": np.nan, "tau": np.nan, "R2": np.nan, "SSE": np.nan, "y_fit": np.full(np.sum(heat_mask), np.nan), "error": str(e)}
+            try:
+                fo_cool = fit_first_order_segment(t[cool_mask], T[cool_mask], t0=t_off)
+            except Exception as e:
+                fo_cool = {"K": np.nan, "tau": np.nan, "R2": np.nan, "SSE": np.nan, "y_fit": np.full(np.sum(cool_mask), np.nan), "error": str(e)}
+
+            try:
+                so_heat = fit_second_order_segment(t[heat_mask], T[heat_mask], t0=t_on)
+            except Exception as e:
+                so_heat = {"K": np.nan, "tau1": np.nan, "tau2": np.nan, "R2": np.nan, "SSE": np.nan, "y_fit": np.full(np.sum(heat_mask), np.nan), "error": str(e)}
+            try:
+                so_cool = fit_second_order_segment(t[cool_mask], T[cool_mask], t0=t_off)
+            except Exception as e:
+                so_cool = {"K": np.nan, "tau1": np.nan, "tau2": np.nan, "R2": np.nan, "SSE": np.nan, "y_fit": np.full(np.sum(cool_mask), np.nan), "error": str(e)}
+
+            base_mask = (t >= (t_on - float(auto_base_window_sec))) & (t < t_on)
+            if np.sum(base_mask) < 3:
+                base_mask = t < t_on
+            if np.sum(base_mask) < 3:
+                n0 = max(3, int(0.1 * len(T)))
+                base_mask = np.zeros(len(T), dtype=bool)
+                base_mask[:n0] = True
+
+            T_base = float(np.mean(T[base_mask]))
+            T_dev = T - T_base
+            u_on_i = float(heater_map.get(up.name, auto_default_u_on))
+            u = build_input_profile(t, t_on=t_on, t_off=t_off, u_on=u_on_i)
+
+            cool_in = None
+            if auto_cool_in_col != "(none)" and auto_cool_in_col in dfi.columns:
+                cin = pd.to_numeric(dfi[auto_cool_in_col], errors="coerce").to_numpy(dtype=float)
+                cool_in = cin[m][idx]
+            cool_out = None
+            if auto_cool_out_col != "(none)" and auto_cool_out_col in dfi.columns:
+                cout = pd.to_numeric(dfi[auto_cool_out_col], errors="coerce").to_numpy(dtype=float)
+                cool_out = cout[m][idx]
+
+            analyses.append({
+                "file": up.name,
+                "t": t,
+                "T": T,
+                "T_med": T_med,
+                "t_on": t_on,
+                "t_off": t_off,
+                "heat_mask": heat_mask,
+                "cool_mask": cool_mask,
+                "fo_heat": fo_heat,
+                "fo_cool": fo_cool,
+                "so_heat": so_heat,
+                "so_cool": so_cool,
+                "u": u,
+                "u_on": u_on_i,
+                "T_base": T_base,
+                "cool_in": cool_in,
+                "cool_out": cool_out,
+            })
+            run_rows.append({
+                "run": up.name,
+                "t": t,
+                "T": T,
+                "T_dev": T_dev,
+                "u": u,
+                "u_on": u_on_i,
+                "t_on": t_on,
+                "t_off": t_off,
+                "T_base": T_base,
+            })
+
+        if not analyses:
+            st.error("No files were successfully analyzed.")
+            if warnings:
+                st.warning("\n".join(warnings))
+            st.stop()
+
+        grouped = fit_full_model_global(run_rows)
+        per_run_map = {pr["run"]: pr for pr in grouped["per_run"]}
+
+        summary_rows = []
+        for a in analyses:
+            pr = per_run_map.get(a["file"], None)
+            if pr is not None:
+                a["grouped_pred_T"] = pr["pred_T"]
+                a["grouped_R2"] = pr["R2"]
+            else:
+                a["grouped_pred_T"] = np.full_like(a["T"], np.nan, dtype=float)
+                a["grouped_R2"] = float("nan")
+
+            summary_rows.append({
+                "file": a["file"],
+                "t_on_s": a["t_on"],
+                "t_off_s": a["t_off"],
+                "first_heat_K": a["fo_heat"]["K"],
+                "first_heat_tau": a["fo_heat"]["tau"],
+                "first_heat_R2": a["fo_heat"]["R2"],
+                "first_heat_SSE": a["fo_heat"]["SSE"],
+                "first_cool_K": a["fo_cool"]["K"],
+                "first_cool_tau": a["fo_cool"]["tau"],
+                "first_cool_R2": a["fo_cool"]["R2"],
+                "first_cool_SSE": a["fo_cool"]["SSE"],
+                "second_heat_K": a["so_heat"]["K"],
+                "second_heat_tau1": a["so_heat"]["tau1"],
+                "second_heat_tau2": a["so_heat"]["tau2"],
+                "second_heat_R2": a["so_heat"]["R2"],
+                "second_heat_SSE": a["so_heat"]["SSE"],
+                "second_cool_K": a["so_cool"]["K"],
+                "second_cool_tau1": a["so_cool"]["tau1"],
+                "second_cool_tau2": a["so_cool"]["tau2"],
+                "second_cool_R2": a["so_cool"]["R2"],
+                "second_cool_SSE": a["so_cool"]["SSE"],
+                "grouped_u_on": a["u_on"],
+                "grouped_R2": a["grouped_R2"],
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+
+        avg_dR2_heat = np.nanmean(summary_df["second_heat_R2"] - summary_df["first_heat_R2"]) if len(summary_df) else float("nan")
+        avg_dR2_cool = np.nanmean(summary_df["second_cool_R2"] - summary_df["first_cool_R2"]) if len(summary_df) else float("nan")
+        better_text = "Second-order is only marginally better than first-order." if (np.nan_to_num(avg_dR2_heat) < 0.02 and np.nan_to_num(avg_dR2_cool) < 0.02) else "Second-order gives a noticeable improvement over first-order."
+
+        part_b_lines = []
+        for a in analyses:
+            pre = np.mean(a["T"][a["t"] < a["t_on"]]) if np.any(a["t"] < a["t_on"]) else a["T"][0]
+            peak = np.max(a["T"])
+            endv = a["T"][-1]
+            line = f"{a['file']}: tank temperature rises from about {pre:.2f} to {peak:.2f} during heating, then trends toward {endv:.2f} after heater OFF."
+            if a["cool_in"] is not None and np.isfinite(a["cool_in"]).sum() > 3:
+                line += f" Coolant-in stays near {np.nanmean(a['cool_in']):.2f} on average."
+            if a["cool_out"] is not None and np.isfinite(a["cool_out"]).sum() > 3:
+                line += f" Coolant-out averages {np.nanmean(a['cool_out']):.2f} and follows the tank trend."
+            part_b_lines.append(line)
+
+        hw_text = (
+            "Part (b):\n"
+            + "\n".join(part_b_lines)
+            + "\n\nPart (c):\n"
+            + f"Average R² improvement (2nd - 1st) is {avg_dR2_heat:.4f} for heating and {avg_dR2_cool:.4f} for cooling. "
+            + better_text + " "
+            + "In the second-order model, tau1 is the slower dominant time constant and tau2 is the faster lag. "
+            + "When tau2 is much smaller than tau1, the process behaves effectively like first-order."
+            + "\n\nPart (d):\n"
+            + f"Grouped full ON/OFF fit gives Kp = {grouped['Kp']:.6g} degC/% and tau = {grouped['tau']:.6g} s, with overall R² = {grouped['R2']:.6g}. "
+            + "This single model captures both heat-up and cool-down because the tank dynamics are unchanged while only the input level changes from ON to OFF. "
+            + "Compared with separate segment fits, grouped fitting trades some local accuracy for one consistent parameter set across all runs."
+        )
+
+        st.session_state[state_key] = {
+            "analyses": analyses,
+            "summary_df": summary_df,
+            "grouped": grouped,
+            "warnings": warnings,
+            "homework_text": hw_text,
+        }
+
+    auto_result = st.session_state.get(state_key, None)
+    if auto_result is None:
+        st.info("Click **Run CHEG 330 Auto Analysis** to compute parts (b), (c), and (d).")
+        st.stop()
+
+    if auto_result.get("warnings"):
+        st.warning("\n".join(auto_result["warnings"]))
+
+    tabs = st.tabs(["Plots", "Summary", "Homework Text", "Export"])
+
+    with tabs[0]:
+        st.subheader("Per-file Plots")
+        for i, a in enumerate(auto_result["analyses"]):
+            st.markdown(f"**{a['file']}**")
+            fig, ax1 = plt.subplots()
+            t = a["t"]
+            T = a["T"]
+            ax1.plot(t, T, label="Measured tank T", linewidth=1.7)
+            ax1.axvspan(a["t_on"], a["t_off"], alpha=0.12, color="tab:green", label="Heating segment")
+            ax1.axvspan(a["t_off"], t[-1], alpha=0.10, color="tab:blue", label="Cooling segment")
+
+            if show_first_order:
+                ax1.plot(t[a["heat_mask"]], a["fo_heat"]["y_fit"], linestyle="--", label="1st-order heating fit")
+                ax1.plot(t[a["cool_mask"]], a["fo_cool"]["y_fit"], linestyle="--", label="1st-order cooling fit")
+            if show_second_order:
+                ax1.plot(t[a["heat_mask"]], a["so_heat"]["y_fit"], linestyle=":", linewidth=2, label="2nd-order heating fit")
+                ax1.plot(t[a["cool_mask"]], a["so_cool"]["y_fit"], linestyle=":", linewidth=2, label="2nd-order cooling fit")
+            if show_grouped_onoff:
+                ax1.plot(t, a["grouped_pred_T"], linewidth=2.1, label="Grouped ON/OFF fit")
+
+            ax1.set_xlabel("Time (s)")
+            ax1.set_ylabel("Tank temperature")
+            ax1.grid(True)
+
+            ax2 = ax1.twinx()
+            ax2.plot(t, a["u"], color="tab:orange", alpha=0.55, label="Heater %")
+            ax2.set_ylabel("Heater input (%)")
+
+            h1, l1 = ax1.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
+            ax1.legend(h1 + h2, l1 + l2, loc="best")
+            png_bytes = fig_to_png_bytes(fig)
+            st.pyplot(fig, clear_figure=True)
+
+            st.download_button(
+                f"Download {a['file']} plot (PNG)",
+                data=png_bytes,
+                file_name=f"{a['file']}_cheg330_plot.png",
+                mime="image/png",
+                key=f"png_{i}_{a['file']}",
+            )
+
+    with tabs[1]:
+        st.subheader("Summary Table")
+        st.dataframe(auto_result["summary_df"], use_container_width=True)
+        g = auto_result["grouped"]
+        st.write(f"Grouped Part D fit: **Kp = {g['Kp']:.6g} degC/%**, **tau = {g['tau']:.6g} s**, **overall R² = {g['R2']:.6g}**, **SSE = {g['SSE']:.6g}**")
+
+    with tabs[2]:
+        st.subheader("Homework Text")
+        st.text_area("Homework-ready answers (Parts b, c, d)", value=auto_result["homework_text"], height=300)
+
+    with tabs[3]:
+        st.subheader("Export")
+        summary_csv = auto_result["summary_df"].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download summary CSV",
+            data=summary_csv,
+            file_name="cheg330_auto_summary.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.download_button(
+            "⬇️ Download homework TXT",
+            data=auto_result["homework_text"],
+            file_name="cheg330_homework_answers.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for a in auto_result["analyses"]:
+                fig, ax1 = plt.subplots()
+                t = a["t"]
+                T = a["T"]
+                ax1.plot(t, T, label="Measured tank T", linewidth=1.7)
+                ax1.axvspan(a["t_on"], a["t_off"], alpha=0.12, color="tab:green")
+                ax1.axvspan(a["t_off"], t[-1], alpha=0.10, color="tab:blue")
+                if show_grouped_onoff:
+                    ax1.plot(t, a["grouped_pred_T"], linewidth=2.1, label="Grouped ON/OFF fit")
+                ax2 = ax1.twinx()
+                ax2.plot(t, a["u"], color="tab:orange", alpha=0.55)
+                png = fig_to_png_bytes(fig)
+                zf.writestr(f"{a['file']}_cheg330_plot.png", png)
+                plt.close(fig)
+        zip_buf.seek(0)
+        st.download_button(
+            "⬇️ Download all PNG plots (ZIP)",
+            data=zip_buf.getvalue(),
+            file_name="cheg330_plots.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    st.stop()
+
 uploaded = st.file_uploader("Upload data (.csv or .xlsx)", type=["csv", "xlsx"])
 
 if uploaded is None:
