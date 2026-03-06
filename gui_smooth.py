@@ -382,7 +382,7 @@ with st.sidebar:
     cheg_auto_enabled = st.toggle("Enable CHEG 330 Auto Analysis", value=False)
 
     if st.button("About"):
-        st.info("Created by Shane Coudriet\nChemical Engineer 2026")
+        st.info("Created by Shane Coudriet\nChemical Engineer 2026\nIn memorium to my GPA")
 
     model = st.selectbox(
         "Model",
