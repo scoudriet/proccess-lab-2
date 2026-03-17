@@ -135,6 +135,68 @@ def fit_first_order(t, y, t0=0.0, fit_y0=True):
     }
 
 
+def fit_k_tau_global(t, y, fit_y0=True):
+    """
+    Fit K and tau (and optionally y0) to first-order step response for entire system.
+
+    Assumes step at t=0, a=1, so K = Ka.
+
+    Returns dict with keys: K, tau, y0, SSE, R2, y_fit, residuals, plus initial guesses.
+    """
+    t, y = _clean_sort(t, y)
+    if t.size < 4:
+        raise ValueError("Need at least 4 valid points to fit.")
+
+    # Initial guesses, assuming t0=0
+    y0_guess = float(np.mean(y[:max(3, len(y)//10)]))
+    y_inf = float(np.mean(y[-max(3, len(y)//10):]))
+    K0 = y_inf - y0_guess
+    tau0 = max((t[-1] - t[0]) / 3.0, 1e-6)
+
+    if fit_y0:
+        popt, _ = curve_fit(
+            lambda tt, K, tau, y0: first_order_response(tt, K, tau, y0=y0, t0=0.0),
+            t, y,
+            p0=[K0, tau0, y0_guess],
+            bounds=([-np.inf, 1e-9, -np.inf], [np.inf, np.inf, np.inf]),
+            maxfev=30000
+        )
+        K_hat, tau_hat, y0_hat = map(float, popt)
+    else:
+        popt, _ = curve_fit(
+            lambda tt, K, tau: first_order_response(tt, K, tau, y0=y0_guess, t0=0.0),
+            t, y,
+            p0=[K0, tau0],
+            bounds=([-np.inf, 1e-9], [np.inf, np.inf]),
+            maxfev=30000
+        )
+        K_hat, tau_hat = map(float, popt)
+        y0_hat = float(y0_guess)
+
+    y_fit = first_order_response(t, K_hat, tau_hat, y0=y0_hat, t0=0.0)
+    residuals = y - y_fit
+
+    SSE = float(np.sum(residuals ** 2))
+    ybar = float(np.mean(y))
+    SStot = float(np.sum((y - ybar) ** 2))
+    R2 = float(1.0 - SSE / SStot) if SStot > 0 else float("nan")
+
+    return {
+        "t": t,
+        "y": y,
+        "K": K_hat,
+        "tau": tau_hat,
+        "y0": y0_hat,
+        "SSE": SSE,
+        "R2": R2,
+        "y_fit": y_fit,
+        "residuals": residuals,
+        "K0": K0,
+        "tau0": tau0,
+        "y0_guess": y0_guess,
+    }
+
+
 def second_order_response(t, Ka, tau1, tau2, y0=0.0, t0=0.0):
     """
     Second-order step response for two real poles:
