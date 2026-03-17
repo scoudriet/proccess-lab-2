@@ -226,3 +226,173 @@ def fit_second_order(t, y, t0=0.0, fit_y0=True):
         "tau2_0": tau2_0,
         "y0_guess": y0_guess,
     }
+
+
+def fopdt_response(t, K, tau, theta, y0=0.0):
+    """
+    First-Order Plus Dead Time (FOPDT) step response:
+
+      y(t) = y0 + K*(1 - exp(-(t - theta)/tau)),   t >= theta
+      y(t) = y0,                                  t <  theta
+
+    Parameters
+    ----------
+    t : array-like
+    K : float      (gain)
+    tau : float    (time constant, >0)
+    theta : float  (dead time, >=0)
+    y0 : float     (baseline)
+    """
+    t = np.asarray(t, dtype=float)
+    ts = np.maximum(t - theta, 0.0)
+    return y0 + K * (1.0 - np.exp(-ts / tau))
+
+
+def fit_fopdt(t, y, fit_y0=True):
+    """
+    Fit K, tau, theta (and optionally y0) to FOPDT step response.
+
+    Assumes step at t=0.
+
+    Returns dict with keys: K, tau, theta, y0, SSE, R2, y_fit, residuals, plus initial guesses.
+    """
+    t, y = _clean_sort(t, y)
+    if t.size < 5:
+        raise ValueError("Need at least 5 valid points to fit FOPDT model.")
+
+    # Initial guesses
+    y0_guess = float(np.mean(y[:max(3, len(y)//10)]))
+    y_inf = float(np.mean(y[-max(3, len(y)//10):]))
+    K0 = y_inf - y0_guess
+    tau0 = max((t[-1] - t[0]) / 3.0, 1e-6)
+    theta0 = 0.0  # start with no dead time
+
+    if fit_y0:
+        popt, _ = curve_fit(
+            lambda tt, K, tau, theta, y0: fopdt_response(tt, K, tau, theta, y0=y0),
+            t, y,
+            p0=[K0, tau0, theta0, y0_guess],
+            bounds=([-np.inf, 1e-9, 0.0, -np.inf], [np.inf, np.inf, t[-1], np.inf]),
+            maxfev=50000
+        )
+        K_hat, tau_hat, theta_hat, y0_hat = map(float, popt)
+    else:
+        popt, _ = curve_fit(
+            lambda tt, K, tau, theta: fopdt_response(tt, K, tau, theta, y0=y0_guess),
+            t, y,
+            p0=[K0, tau0, theta0],
+            bounds=([-np.inf, 1e-9, 0.0], [np.inf, np.inf, t[-1]]),
+            maxfev=50000
+        )
+        K_hat, tau_hat, theta_hat = map(float, popt)
+        y0_hat = float(y0_guess)
+
+    y_fit = fopdt_response(t, K_hat, tau_hat, theta_hat, y0=y0_hat)
+    residuals = y - y_fit
+
+    SSE = float(np.sum(residuals ** 2))
+    ybar = float(np.mean(y))
+    SStot = float(np.sum((y - ybar) ** 2))
+    R2 = float(1.0 - SSE / SStot) if SStot > 0 else float("nan")
+
+    return {
+        "t": t,
+        "y": y,
+        "K": K_hat,
+        "tau": tau_hat,
+        "theta": theta_hat,
+        "y0": y0_hat,
+        "SSE": SSE,
+        "R2": R2,
+        "y_fit": y_fit,
+        "residuals": residuals,
+        "K0": K0,
+        "tau0": tau0,
+        "theta0": theta0,
+        "y0_guess": y0_guess,
+    }
+
+
+def fopdt_ka_response(t, Ka, tau, theta, y0=0.0):
+    """
+    First-Order Plus Dead Time (FOPDT) step response with lumped gain Ka:
+
+      y(t) = y0 + Ka*(1 - exp(-(t - theta)/tau)),   t >= theta
+      y(t) = y0,                                   t <  theta
+
+    Parameters
+    ----------
+    t : array-like
+    Ka : float     (lumped gain, K * step size)
+    tau : float    (time constant, >0)
+    theta : float  (dead time, >=0)
+    y0 : float     (baseline)
+    """
+    t = np.asarray(t, dtype=float)
+    ts = np.maximum(t - theta, 0.0)
+    return y0 + Ka * (1.0 - np.exp(-ts / tau))
+
+
+def fit_fopdt_ka(t, y, fit_y0=True):
+    """
+    Fit Ka, tau, theta (and optionally y0) to FOPDT step response.
+
+    Assumes step at t=0.
+
+    Returns dict with keys: Ka, tau, theta, y0, SSE, R2, y_fit, residuals, plus initial guesses.
+    """
+    t, y = _clean_sort(t, y)
+    if t.size < 5:
+        raise ValueError("Need at least 5 valid points to fit FOPDT model.")
+
+    # Initial guesses
+    y0_guess = float(np.mean(y[:max(3, len(y)//10)]))
+    y_inf = float(np.mean(y[-max(3, len(y)//10):]))
+    Ka0 = y_inf - y0_guess
+    tau0 = max((t[-1] - t[0]) / 3.0, 1e-6)
+    theta0 = 0.0  # start with no dead time
+
+    if fit_y0:
+        popt, _ = curve_fit(
+            lambda tt, Ka, tau, theta, y0: fopdt_ka_response(tt, Ka, tau, theta, y0=y0),
+            t, y,
+            p0=[Ka0, tau0, theta0, y0_guess],
+            bounds=([-np.inf, 1e-9, 0.0, -np.inf], [np.inf, np.inf, t[-1], np.inf]),
+            maxfev=50000
+        )
+        Ka_hat, tau_hat, theta_hat, y0_hat = map(float, popt)
+    else:
+        popt, _ = curve_fit(
+            lambda tt, Ka, tau, theta: fopdt_ka_response(tt, Ka, tau, theta, y0=y0_guess),
+            t, y,
+            p0=[Ka0, tau0, theta0],
+            bounds=([-np.inf, 1e-9, 0.0], [np.inf, np.inf, t[-1]]),
+            maxfev=50000
+        )
+        Ka_hat, tau_hat, theta_hat = map(float, popt)
+        y0_hat = float(y0_guess)
+
+    y_fit = fopdt_ka_response(t, Ka_hat, tau_hat, theta_hat, y0=y0_hat)
+    residuals = y - y_fit
+
+    SSE = float(np.sum(residuals ** 2))
+    ybar = float(np.mean(y))
+    SStot = float(np.sum((y - ybar) ** 2))
+    R2 = float(1.0 - SSE / SStot) if SStot > 0 else float("nan")
+
+    return {
+        "t": t,
+        "y": y,
+        "Ka": Ka_hat,
+        "tau": tau_hat,
+        "theta": theta_hat,
+        "y0": y0_hat,
+        "SSE": SSE,
+        "R2": R2,
+        "y_fit": y_fit,
+        "residuals": residuals,
+        "Ka0": Ka0,
+        "tau0": tau0,
+        "theta0": theta0,
+        "y0_guess": y0_guess,
+    }
