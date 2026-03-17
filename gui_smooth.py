@@ -16,6 +16,7 @@ from fit_model import (
     fit_second_order as fit_Ka_tau2,    # returns keys: Ka, tau1, tau2, y0, ...
     fit_fopdt,                          # returns keys: K, tau, theta, y0, ...
     fit_fopdt_ka,                       # returns keys: Ka, tau, theta, y0, ...
+    fit_sopdt,                          # returns keys: Ka, tau1, tau2, theta, y0, ...
 )
 
 # 2) K model (with a)
@@ -495,9 +496,10 @@ with st.sidebar:
             "Fit 2nd-order Ka, τ1, τ2",
             "FOPDT (K, τ, θ)",
             "FOPDT (Ka, τ, θ)",
+            "SOPDT (Ka, τ1, τ2, θ)",
             FULL_MODEL_LABEL,
         ],
-        help="Ka model treats K·a as one parameter (prof example). K model separates K using your step size a. Second-order model fits two real time constants. FOPDT fits first-order plus dead time. Full model fits one Kp/tau across full ON/OFF data."
+        help="Ka model treats K·a as one parameter (prof example). K model separates K using your step size a. Second-order model fits two real time constants. FOPDT fits first-order plus dead time. SOPDT fits second-order plus dead time. Full model fits one Kp/tau across full ON/OFF data."
     )
 
     full_mode = model == FULL_MODEL_LABEL
@@ -1268,6 +1270,11 @@ with tabs[0]:
                 # Shift back for plotting
                 yhat = result["y_fit"]
                 ax.plot(t_fit, yhat, linewidth=2, label="Fit (Ka, τ, θ)")
+            elif model == "SOPDT (Ka, τ1, τ2, θ)":
+                result = fit_sopdt(t_fit - t0, y_fit_data, fit_y0=bool(fit_y0))
+                # Shift back for plotting
+                yhat = result["y_fit"]
+                ax.plot(t_fit, yhat, linewidth=2, label="Fit (Ka, τ1, τ2, θ)")
             else:
                 if fit_K_tau_with_a is None:
                     st.error("K-with-a model not available. Create fit_model_with_a.py and restart Streamlit.")
@@ -1357,6 +1364,21 @@ if fit_btn:
             rr["segment"] = std_segment_choice if std_auto_split else "Full"
             st.session_state["last_result"] = rr
             st.session_state["last_model"] = "FOPDT_Ka"
+        elif model == "SOPDT (Ka, τ1, τ2, θ)":
+            rr = fit_sopdt(t_fit - t0, y_fit_data, fit_y0=bool(fit_y0))
+            y_full = np.full_like(t_raw, np.nan, dtype=float)
+            r_full = np.full_like(t_raw, np.nan, dtype=float)
+            y_full[fit_mask] = rr["y_fit"]
+            r_full[fit_mask] = rr["residuals"]
+            rr["y_fit_full"] = y_full
+            rr["residuals_full"] = r_full
+            rr["n_raw"] = int(len(t_raw))
+            rr["t_on"] = float(t_on_std)
+            rr["t_off"] = float(t_off_std)
+            rr["split_used"] = bool(std_auto_split)
+            rr["segment"] = std_segment_choice if std_auto_split else "Full"
+            st.session_state["last_result"] = rr
+            st.session_state["last_model"] = "SOPDT"
         else:
             if fit_K_tau_with_a is not None:
                 rr = fit_K_tau_with_a(t_fit - t0, y_fit_data, a=float(a), fit_y0=bool(fit_y0))
@@ -1424,6 +1446,12 @@ with tabs[1]:
                 f"**θ** = {result['theta']:.6g}   |   **y₀** = {result['y0']:.6g}"
             )
             st.write(f"**SSE** = {result['SSE']:.6g}   |   **R²** = {result['R2']:.6g}")
+        elif mode_key == "SOPDT":
+            st.write(
+                f"**Ka** = {result['Ka']:.6g}   |   **τ1** = {result['tau1']:.6g}   |   "
+                f"**τ2** = {result['tau2']:.6g}   |   **θ** = {result['theta']:.6g}   |   **y₀** = {result['y0']:.6g}"
+            )
+            st.write(f"**SSE** = {result['SSE']:.6g}   |   **R²** = {result['R2']:.6g}")
         else:
             st.write(
                 f"**K** = {result['K']:.6g}   |   **τ** = {result['tau']:.6g}   |   "
@@ -1485,6 +1513,13 @@ with tabs[2]:
                 "parameter": ["model", "t0", "Ka", "tau", "theta", "y0", "SSE", "R2", "smoothed_fit", "split_used", "segment", "t_on", "t_off"],
                 "value": ["FOPDT_Ka", t0, result["Ka"], result["tau"], result["theta"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit, result.get("split_used", False), result.get("segment", "Full"), result.get("t_on", np.nan), result.get("t_off", np.nan)],
             })
+        elif mode_key == "SOPDT":
+            out["y_fit"] = result.get("y_fit_full", result["y_fit"])
+            out["residual"] = result.get("residuals_full", result["residuals"])
+            summary = pd.DataFrame({
+                "parameter": ["model", "t0", "Ka", "tau1", "tau2", "theta", "y0", "SSE", "R2", "smoothed_fit", "split_used", "segment", "t_on", "t_off"],
+                "value": ["SOPDT", t0, result["Ka"], result["tau1"], result["tau2"], result["theta"], result["y0"], result["SSE"], result["R2"], use_smoothed_for_fit, result.get("split_used", False), result.get("segment", "Full"), result.get("t_on", np.nan), result.get("t_off", np.nan)],
+            })
         else:
             # result["y_fit"] corresponds to (t - t0) fit, but we used same t grid so it matches
             out["y_fit"] = result.get("y_fit_full", result["y_fit"])
@@ -1507,14 +1542,15 @@ with tabs[2]:
         st.write("**Excel instructions (Solver version):**")
         st.markdown(
             """
-- Put your parameters in cells (example): `Ka` (or `K`), `tau`, `y0`, and (if using K-model) `a`, (if FOPDT) `theta`.
+- Put your parameters in cells (example): `Ka` (or `K`), `tau`, `y0`, and (if using K-model) `a`, (if FOPDT/SOPDT) `theta`, (if 2nd-order/SOPDT) `tau1`, `tau2`.
 - Make a `y_fit` column using the formula:
   - Ka model: `y0 + Ka*(1-EXP(-t/tau))`
   - K model:  `y0 + K*a*(1-EXP(-t/tau))`
   - FOPDT model: `y0 + K*(1-EXP(-(t-theta)/tau))` (use IF(t>=theta, formula, y0) for dead time)
   - 2nd-order model: `y0 + Ka*(1-(tau1*EXP(-t/tau1)-tau2*EXP(-t/tau2))/(tau1-tau2))`
+  - SOPDT model: `y0 + Ka*(1-(tau1*EXP(-(t-theta)/tau1)-tau2*EXP(-(t-theta)/tau2))/(tau1-tau2))` (use IF(t>=theta, formula, y0) for dead time)
 - Make a residual column: `y - y_fit`
 - SSE cell: `=SUMSQ(residual_range)`
-- Use **Data → Solver**: minimize SSE by changing fit parameters (`Ka/K`, `tau` or `tau1/tau2`, `theta` if FOPDT, and `y0` if fitting it). Constrain all `tau` values > 0, `theta` >= 0.
+- Use **Data → Solver**: minimize SSE by changing fit parameters (`Ka/K`, `tau` or `tau1/tau2`, `theta` if FOPDT/SOPDT, and `y0` if fitting it). Constrain all `tau` values > 0, `theta` >= 0.
 """
         )

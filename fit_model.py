@@ -396,3 +396,109 @@ def fit_fopdt_ka(t, y, fit_y0=True):
         "theta0": theta0,
         "y0_guess": y0_guess,
     }
+
+
+def sopdt_response(t, Ka, tau1, tau2, theta, y0=0.0):
+    """
+    Second-Order Plus Dead Time (SOPDT) step response:
+
+      y(t) = y0 + Ka * (1 - (tau1*exp(-(t-theta)/tau1) - tau2*exp(-(t-theta)/tau2))/(tau1 - tau2)),   t >= theta
+      y(t) = y0,                                                                                     t <  theta
+
+    Parameters
+    ----------
+    t : array-like
+    Ka : float     (lumped gain)
+    tau1 : float   (time constant 1, >0)
+    tau2 : float   (time constant 2, >0)
+    theta : float  (dead time, >=0)
+    y0 : float     (baseline)
+    """
+    t = np.asarray(t, dtype=float)
+    ts = np.maximum(t - theta, 0.0)
+
+    tau1 = float(max(tau1, 1e-12))
+    tau2 = float(max(tau2, 1e-12))
+
+    # Numerically-stable branch when time constants are nearly equal.
+    if abs(tau1 - tau2) <= 1e-8 * max(tau1, tau2):
+        tau = 0.5 * (tau1 + tau2)
+        shape = 1.0 - np.exp(-ts / tau) * (1.0 + ts / tau)
+    else:
+        shape = 1.0 - (
+            tau1 * np.exp(-ts / tau1) - tau2 * np.exp(-ts / tau2)
+        ) / (tau1 - tau2)
+
+    return y0 + Ka * shape
+
+
+def fit_sopdt(t, y, fit_y0=True):
+    """
+    Fit Ka, tau1, tau2, theta (and optionally y0) to SOPDT step response.
+
+    Assumes step at t=0.
+
+    Returns dict with keys: Ka, tau1, tau2, theta, y0, SSE, R2, y_fit, residuals, plus initial guesses.
+    """
+    t, y = _clean_sort(t, y)
+    if t.size < 7:
+        raise ValueError("Need at least 7 valid points to fit SOPDT model.")
+
+    # Initial guesses
+    y0_guess = float(np.mean(y[:max(3, len(y)//10)]))
+    y_inf = float(np.mean(y[-max(3, len(y)//10):]))
+    Ka0 = y_inf - y0_guess
+    tau0 = max((t[-1] - t[0]) / 3.0, 1e-6)
+    tau1_0 = max(0.5 * tau0, 1e-6)
+    tau2_0 = max(2.0 * tau0, 2e-6)
+    theta0 = 0.0  # start with no dead time
+
+    if fit_y0:
+        popt, _ = curve_fit(
+            lambda tt, Ka, tau1, tau2, theta, y0: sopdt_response(tt, Ka, tau1, tau2, theta, y0=y0),
+            t, y,
+            p0=[Ka0, tau1_0, tau2_0, theta0, y0_guess],
+            bounds=([-np.inf, 1e-9, 1e-9, 0.0, -np.inf], [np.inf, np.inf, np.inf, t[-1], np.inf]),
+            maxfev=50000
+        )
+        Ka_hat, tau1_hat, tau2_hat, theta_hat, y0_hat = map(float, popt)
+    else:
+        popt, _ = curve_fit(
+            lambda tt, Ka, tau1, tau2, theta: sopdt_response(tt, Ka, tau1, tau2, theta, y0=y0_guess),
+            t, y,
+            p0=[Ka0, tau1_0, tau2_0, theta0],
+            bounds=([-np.inf, 1e-9, 1e-9, 0.0], [np.inf, np.inf, np.inf, t[-1]]),
+            maxfev=50000
+        )
+        Ka_hat, tau1_hat, tau2_hat, theta_hat = map(float, popt)
+        y0_hat = float(y0_guess)
+
+    # Keep tau1 <= tau2 for consistent reporting.
+    tau1_hat, tau2_hat = sorted([max(tau1_hat, 1e-9), max(tau2_hat, 1e-9)])
+
+    y_fit = sopdt_response(t, Ka_hat, tau1_hat, tau2_hat, theta_hat, y0=y0_hat)
+    residuals = y - y_fit
+
+    SSE = float(np.sum(residuals ** 2))
+    ybar = float(np.mean(y))
+    SStot = float(np.sum((y - ybar) ** 2))
+    R2 = float(1.0 - SSE / SStot) if SStot > 0 else float("nan")
+
+    return {
+        "t": t,
+        "y": y,
+        "Ka": Ka_hat,
+        "tau1": tau1_hat,
+        "tau2": tau2_hat,
+        "theta": theta_hat,
+        "y0": y0_hat,
+        "SSE": SSE,
+        "R2": R2,
+        "y_fit": y_fit,
+        "residuals": residuals,
+        "Ka0": Ka0,
+        "tau1_0": tau1_0,
+        "tau2_0": tau2_0,
+        "theta0": theta0,
+        "y0_guess": y0_guess,
+    }
