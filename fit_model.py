@@ -356,7 +356,17 @@ def objective_fopdt_global(params, t, u, y, use_bias=False):
     return float(np.sum((y - yhat) ** 2))
 
 
-def fit_fopdt_global(t, u, y, use_bias=False):
+def fit_fopdt_global(
+    t,
+    u,
+    y,
+    use_bias=False,
+    initial_guess=None,
+    bounds=None,
+    maxiter=300,
+    max_delay_candidates=25,
+    refine_delay_window=2,
+):
     """
     Fit one global FOPDT model to the full dataset using a non-recursive
     convolution evaluation of the full delayed input sequence.
@@ -396,39 +406,83 @@ def fit_fopdt_global(t, u, y, use_bias=False):
     if use_bias:
         y_bias0 = float(y[0])
         y_margin = max(2.0 * dy_span, 1.0)
-        lower = np.array([-K_bound, tau_min, np.min(y) - y_margin], dtype=float)
-        upper = np.array([K_bound, tau_max, np.max(y) + y_margin], dtype=float)
+        lower_full = np.array([-K_bound, tau_min, 0.0, np.min(y) - y_margin], dtype=float)
+        upper_full = np.array([K_bound, tau_max, theta_max, np.max(y) + y_margin], dtype=float)
         starts = [
             np.array([K0, tau0, y_bias0], dtype=float),
             np.array([0.5 * K0 if abs(K0) > 1e-12 else np.sign(y[-1] - y[0]) * max(0.1, dy_span / du_scale), max(0.5 * tau0, tau_min), y_bias0], dtype=float),
             np.array([1.5 * K0 if abs(K0) > 1e-12 else max(0.1, dy_span / du_scale), min(2.0 * tau0, tau_max), y_bias0], dtype=float),
         ]
+        initial_guess_used = np.array([K0, tau0, theta0, y_bias0], dtype=float)
     else:
         y_bias0 = None
-        lower = np.array([-K_bound, tau_min], dtype=float)
-        upper = np.array([K_bound, tau_max], dtype=float)
+        lower_full = np.array([-K_bound, tau_min, 0.0], dtype=float)
+        upper_full = np.array([K_bound, tau_max, theta_max], dtype=float)
         starts = [
             np.array([K0, tau0], dtype=float),
             np.array([0.5 * K0 if abs(K0) > 1e-12 else np.sign(y[-1] - y[0]) * max(0.1, dy_span / du_scale), max(0.5 * tau0, tau_min)], dtype=float),
             np.array([1.5 * K0 if abs(K0) > 1e-12 else max(0.1, dy_span / du_scale), min(2.0 * tau0, tau_max)], dtype=float),
         ]
+        initial_guess_used = np.array([K0, tau0, theta0], dtype=float)
 
-    if n_delay_max <= 60:
-        delay_candidates = np.arange(n_delay_max + 1, dtype=int)
+    if bounds is not None:
+        lower_in, upper_in = bounds
+        lower_full = np.asarray(lower_in, dtype=float).flatten()
+        upper_full = np.asarray(upper_in, dtype=float).flatten()
+        expected = 4 if use_bias else 3
+        if lower_full.size != expected or upper_full.size != expected:
+            raise ValueError(f"bounds must have {expected} entries for this fit.")
+        if not np.all(np.isfinite(lower_full)) or not np.all(np.isfinite(upper_full)) or np.any(lower_full >= upper_full):
+            raise ValueError("bounds must be finite and satisfy lower < upper.")
+        tau_min = float(lower_full[1])
+        tau_max = float(upper_full[1])
+        theta0 = float(np.clip(theta0, lower_full[2], upper_full[2]))
+
+    if initial_guess is not None:
+        guess_arr = np.asarray(initial_guess, dtype=float).flatten()
+        expected = 4 if use_bias else 3
+        if guess_arr.size != expected:
+            raise ValueError(f"initial_guess must have {expected} entries for this fit.")
+        initial_guess_used = guess_arr.copy()
+        theta0 = float(np.clip(guess_arr[2], lower_full[2], upper_full[2]))
+        if use_bias:
+            starts.insert(0, np.array([guess_arr[0], guess_arr[1], guess_arr[3]], dtype=float))
+        else:
+            starts.insert(0, np.array([guess_arr[0], guess_arr[1]], dtype=float))
+
+    if use_bias:
+        lower = np.array([lower_full[0], lower_full[1], lower_full[3]], dtype=float)
+        upper = np.array([upper_full[0], upper_full[1], upper_full[3]], dtype=float)
     else:
-        delay_candidates = np.unique(np.round(np.linspace(0, n_delay_max, 60)).astype(int))
-    theta_guess_idx = int(np.clip(round(theta0 / dt), 0, n_delay_max))
+        lower = np.array([lower_full[0], lower_full[1]], dtype=float)
+        upper = np.array([upper_full[0], upper_full[1]], dtype=float)
+
+    theta_min = float(max(0.0, lower_full[2]))
+    theta_max = float(max(theta_min, upper_full[2]))
+    n_delay_min = int(max(0, round(theta_min / dt)))
+    n_delay_max = int(max(n_delay_min, round(theta_max / dt)))
+
+    max_delay_candidates = int(max(5, max_delay_candidates))
+    refine_delay_window = int(max(0, refine_delay_window))
+    maxiter = int(max(10, maxiter))
+
+    if n_delay_max <= max_delay_candidates:
+        delay_candidates = np.arange(n_delay_min, n_delay_max + 1, dtype=int)
+    else:
+        delay_candidates = np.unique(np.round(np.linspace(n_delay_min, n_delay_max, max_delay_candidates)).astype(int))
+    theta_guess_idx = int(np.clip(round(theta0 / dt), n_delay_min, n_delay_max))
     delay_candidates = np.unique(
         np.concatenate([
             delay_candidates,
             np.array(
-                [theta_guess_idx, max(theta_guess_idx - 1, 0), min(theta_guess_idx + 1, n_delay_max)],
+                [theta_guess_idx, max(theta_guess_idx - 1, n_delay_min), min(theta_guess_idx + 1, n_delay_max)],
                 dtype=int,
             ),
         ])
     )
 
     def _assemble_params(x, theta_value):
+        x = np.asarray(x, dtype=float).flatten()
         if use_bias:
             return np.array([float(x[0]), float(x[1]), float(theta_value), float(x[2])], dtype=float)
         return np.array([float(x[0]), float(x[1]), float(theta_value)], dtype=float)
@@ -452,7 +506,7 @@ def fit_fopdt_global(t, u, y, use_bias=False):
                 x0=x0,
                 method="L-BFGS-B",
                 bounds=list(zip(lower, upper)),
-                options={"maxiter": 2000},
+                options={"maxiter": maxiter},
             )
             x_hat = np.clip(np.asarray(opt.x, dtype=float), lower, upper)
             params_hat = _assemble_params(x_hat, theta_value)
@@ -477,7 +531,11 @@ def fit_fopdt_global(t, u, y, use_bias=False):
     if best_params is None:
         raise ValueError("Global FOPDT fit failed to converge.")
 
-    refine_delays = np.arange(max(0, best_delay - 3), min(n_delay_max, best_delay + 3) + 1, dtype=int)
+    refine_delays = np.arange(
+        max(n_delay_min, best_delay - refine_delay_window),
+        min(n_delay_max, best_delay + refine_delay_window) + 1,
+        dtype=int,
+    )
     if use_bias:
         seeded_start = [np.array([best_params[0], best_params[1], best_params[3]], dtype=float)]
     else:
@@ -543,6 +601,10 @@ def fit_fopdt_global(t, u, y, use_bias=False):
         "tau0": float(tau0),
         "theta0": float(theta0),
         "first_step_time": first_step_time,
+        "initial_guess_used": initial_guess_used.copy(),
+        "bounds_used": (lower_full.copy(), upper_full.copy()),
+        "optimizer_maxiter": int(maxiter),
+        "max_delay_candidates": int(max_delay_candidates),
     }
 
 

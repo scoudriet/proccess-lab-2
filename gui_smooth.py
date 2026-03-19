@@ -92,6 +92,166 @@ def guess_pump_power_column(columns, exclude=None):
     return best_col
 
 
+def normalize_sheet_name(sheet_name: str):
+    txt = str(sheet_name).strip()
+    return txt if txt else 0
+
+
+@st.cache_data(show_spinner=False)
+def load_uploaded_dataframe_cached(file_bytes: bytes, filename: str, sheet_name, header_flag: bool) -> pd.DataFrame:
+    buf = io.BytesIO(file_bytes)
+    name = str(filename).lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(buf, header=0 if header_flag else None)
+    return pd.read_excel(buf, sheet_name=sheet_name, header=0 if header_flag else None)
+
+
+@st.cache_data(show_spinner=False)
+def preprocess_global_fopdt_data_cached(
+    file_bytes: bytes,
+    filename: str,
+    sheet_name,
+    header_flag: bool,
+    t_col,
+    y_col,
+    u_col,
+    smooth_window: int,
+):
+    df = load_uploaded_dataframe_cached(file_bytes, filename, sheet_name, header_flag)
+    try:
+        t_all = parse_time_to_elapsed_seconds(df[t_col])
+    except Exception:
+        t_all = pd.to_numeric(df[t_col], errors="coerce").to_numpy(dtype=float)
+
+    y_all = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
+    u_all = pd.to_numeric(df[u_col], errors="coerce").to_numpy(dtype=float)
+
+    mask = np.isfinite(t_all) & np.isfinite(y_all) & np.isfinite(u_all)
+    t = t_all[mask]
+    y = y_all[mask]
+    u = u_all[mask]
+
+    if t.size < 6:
+        return {"error": "Need at least 6 valid time, tank-height, and pump-power points for global FOPDT."}
+
+    order = np.argsort(t)
+    t = t[order]
+    y = y[order]
+    u = u[order]
+
+    y_smooth = moving_average(y, smooth_window)
+    return {
+        "t": t,
+        "y": y,
+        "u": u,
+        "y_smooth": y_smooth,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def downsample_global_arrays_cached(
+    t: np.ndarray,
+    y: np.ndarray,
+    u: np.ndarray,
+    stride: int,
+):
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    u = np.asarray(u, dtype=float)
+    stride = int(max(1, stride))
+    if t.size < 3 or stride <= 1:
+        idx = np.arange(t.size, dtype=int)
+        return {"t": t, "y": y, "u": u, "idx": idx}
+
+    idx = np.arange(0, t.size, stride, dtype=int)
+    if idx[-1] != t.size - 1:
+        idx = np.append(idx, t.size - 1)
+    change_idx = np.where(np.abs(np.diff(u)) > 1e-12)[0] + 1
+    idx = np.unique(np.concatenate([idx, np.array([0, t.size - 1], dtype=int), change_idx]))
+    return {
+        "t": t[idx],
+        "y": y[idx],
+        "u": u[idx],
+        "idx": idx,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def build_global_fit_defaults_cached(t: np.ndarray, u: np.ndarray, y: np.ndarray):
+    t = np.asarray(t, dtype=float)
+    u = np.asarray(u, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if t.size < 6:
+        return {"error": "Need at least 6 valid points to build fit defaults."}
+
+    dt = np.diff(t)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        return {"error": "Need strictly increasing time samples."}
+
+    dt_med = float(np.median(dt))
+    span_t = float(max(t[-1] - t[0], dt_med))
+    du_scale = max(float(np.ptp(u)), float(np.max(np.abs(u))), 1e-9)
+    dy_span = max(float(np.ptp(y)), abs(float(y[-1] - y[0])), float(np.std(y)), 1e-6)
+    corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
+    sign = -1.0 if corr < 0 else 1.0
+    K0 = sign * max(dy_span / du_scale, 1e-3)
+    tau0 = max(0.2 * span_t, dt_med)
+    theta0 = 0.0
+    K_bound = max(10.0 * abs(K0), 10.0 * dy_span / du_scale, 1.0)
+    tau_min = max(0.51 * dt_med, 1e-9)
+    tau_max = max(5.0 * span_t, 10.0 * dt_med, 2.0 * tau0)
+    theta_max = max(0.0, min(0.5 * span_t, span_t))
+    return {
+        "initial_guess": np.array([K0, tau0, theta0], dtype=float),
+        "bounds": (
+            np.array([-K_bound, tau_min, 0.0], dtype=float),
+            np.array([K_bound, tau_max, theta_max], dtype=float),
+        ),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def run_global_fopdt_fit_cached(
+    cache_key,
+    t_fit: np.ndarray,
+    u_fit: np.ndarray,
+    y_fit: np.ndarray,
+    t_full: np.ndarray,
+    u_full: np.ndarray,
+    y_full: np.ndarray,
+    initial_guess: np.ndarray,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
+    maxiter: int,
+    max_delay_candidates: int,
+    downsample_stride: int,
+):
+    del cache_key, downsample_stride
+    rr = fit_fopdt_global(
+        t_fit,
+        u_fit,
+        y_fit,
+        use_bias=False,
+        initial_guess=initial_guess,
+        bounds=(lower_bounds, upper_bounds),
+        maxiter=maxiter,
+        max_delay_candidates=max_delay_candidates,
+    )
+    y_fit_plot = simulate_fopdt_global(rr["params"], t_full, u_full, y_full[0], use_bias=False)
+    residual_plot = y_full - y_fit_plot
+    sse_plot = float(np.sum(residual_plot ** 2))
+    rmse_plot = float(np.sqrt(sse_plot / len(y_full)))
+    sst_plot = float(np.sum((y_full - np.mean(y_full)) ** 2))
+    r2_plot = float(1.0 - sse_plot / sst_plot) if sst_plot > 0 else float("nan")
+    rr["y_fit_plot"] = y_fit_plot
+    rr["residual_plot"] = residual_plot
+    rr["SSE_plot"] = sse_plot
+    rr["RMSE_plot"] = rmse_plot
+    rr["R2_plot"] = r2_plot
+    return rr
+
+
 def make_excel_bytes(data_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -633,8 +793,41 @@ with st.sidebar:
     else:
         a = None
 
+    if global_fopdt_mode:
+        st.divider()
+        st.subheader("Global Fit")
+        downsample_stride = st.selectbox(
+            "Fit downsampling",
+            options=[1, 2, 5, 10],
+            index=2,
+            help="Use full-resolution data for plotting, but fit on every Nth sample while preserving input-change points.",
+        )
+        global_maxiter = st.number_input(
+            "Optimizer max iterations",
+            min_value=25,
+            max_value=2000,
+            value=300,
+            step=25,
+        )
+        global_delay_grid = st.number_input(
+            "Dead-time grid samples",
+            min_value=5,
+            max_value=60,
+            value=25,
+            step=5,
+        )
+    else:
+        downsample_stride = 1
+        global_maxiter = 300
+        global_delay_grid = 25
+
     st.divider()
-    fit_btn = st.button("🚀 Fit model", type="primary", use_container_width=True)
+    if global_fopdt_mode:
+        run_fit = st.button("Run Global FOPDT Fit", type="primary", use_container_width=True)
+        fit_btn = False
+    else:
+        run_fit = False
+        fit_btn = st.button("🚀 Fit model", type="primary", use_container_width=True)
 
 
 # Main: upload + preview + results
@@ -1022,17 +1215,15 @@ if uploaded is None:
     st.info("Upload a CSV or Excel file to begin.")
     st.stop()
 
+uploaded_bytes = uploaded.getvalue()
+file_signature = (str(uploaded.name), len(uploaded_bytes), hash(uploaded_bytes))
+sheet_name = normalize_sheet_name(sheet)
+status_placeholder = st.empty()
+status_placeholder.info("Loading data...")
+
 # Read file
 try:
-    name = uploaded.name.lower()
-    if name.endswith(".csv"):
-        df = pd.read_csv(uploaded, header=0 if header else None)
-    else:
-        df = pd.read_excel(
-            uploaded,
-            sheet_name=sheet.strip() if sheet.strip() else 0,
-            header=0 if header else None,
-        )
+    df = load_uploaded_dataframe_cached(uploaded_bytes, uploaded.name, sheet_name, bool(header))
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
@@ -1040,6 +1231,8 @@ except Exception as e:
 if df.shape[1] < 2:
     st.error("Need at least 2 columns: time and measured output.")
     st.stop()
+
+status_placeholder.empty()
 
 # Column selectors
 col1, col2, col3, col4 = st.columns([1, 1, 1, 2], gap="large")
@@ -1076,33 +1269,71 @@ with col4:
     st.dataframe(df[preview_cols].head(10), use_container_width=True)
 
 if global_fopdt_mode:
-    try:
-        t_all = parse_time_to_elapsed_seconds(df[t_col])
-    except Exception:
-        t_all = pd.to_numeric(df[t_col], errors="coerce").to_numpy(dtype=float)
+    st.subheader("Step 1: Preview Data and Select Columns")
+    status_placeholder.info("Loading data...")
+    global_prepped = preprocess_global_fopdt_data_cached(
+        uploaded_bytes,
+        uploaded.name,
+        sheet_name,
+        bool(header),
+        t_col,
+        y_col,
+        u_col,
+        int(smooth_window),
+    )
+    status_placeholder.empty()
 
-    y_all = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
-    u_all = pd.to_numeric(df[u_col], errors="coerce").to_numpy(dtype=float)
-
-    mask = np.isfinite(t_all) & np.isfinite(y_all) & np.isfinite(u_all)
-    t_global = t_all[mask]
-    y_global = y_all[mask]
-    u_global = u_all[mask]
-
-    if t_global.size < 6:
-        st.error("Need at least 6 valid time, tank-height, and pump-power points for global FOPDT.")
+    if "error" in global_prepped:
+        st.error(global_prepped["error"])
         st.stop()
 
-    order = np.argsort(t_global)
-    t_global = t_global[order]
-    y_global = y_global[order]
-    u_global = u_global[order]
-
-    y_global_smooth = moving_average(y_global, smooth_window)
+    t_global = global_prepped["t"]
+    y_global = global_prepped["y"]
+    u_global = global_prepped["u"]
+    y_global_smooth = global_prepped["y_smooth"]
     y_global_fit = y_global_smooth if use_smoothed_for_fit else y_global
 
-    st.subheader("Global FOPDT Debug")
+    downsampled = downsample_global_arrays_cached(t_global, y_global_fit, u_global, int(downsample_stride))
+    fit_defaults = build_global_fit_defaults_cached(downsampled["t"], downsampled["u"], downsampled["y"])
+    if "error" in fit_defaults:
+        st.error(fit_defaults["error"])
+        st.stop()
+
+    initial_guess = fit_defaults["initial_guess"]
+    lower_bounds, upper_bounds = fit_defaults["bounds"]
+
+    current_signature = (
+        file_signature,
+        str(sheet_name),
+        bool(header),
+        str(t_col),
+        str(y_col),
+        str(u_col),
+        int(smooth_window),
+        bool(use_smoothed_for_fit),
+        int(downsample_stride),
+        int(global_maxiter),
+        int(global_delay_grid),
+        tuple(np.round(initial_guess, 12)),
+        tuple(np.round(lower_bounds, 12)),
+        tuple(np.round(upper_bounds, 12)),
+    )
+
+    stored_result = st.session_state.get("global_fopdt_last_result")
+    stored_signature = st.session_state.get("global_fopdt_signature")
+    stale_result_msg = None
+    if stored_result is not None and stored_signature != current_signature:
+        stale_result_msg = "Selections changed. Click Run Global FOPDT Fit to update the cached result."
+        global_result = None
+    else:
+        global_result = stored_result
+
     st.write(f"Using columns: `t = {t_col}`   |   `y = {y_col}`   |   `u = {u_col}`")
+    st.caption(
+        f"Fitting on {len(downsampled['t'])} of {len(t_global)} samples "
+        f"(downsampling = every {int(downsample_stride)} point, preserving input changes)."
+    )
+
     debug_df = pd.DataFrame({
         "t": t_global[:20],
         "y": y_global[:20],
@@ -1119,34 +1350,45 @@ if global_fopdt_mode:
     ax_u.grid(True)
     st.pyplot(fig_u, clear_figure=True)
 
-    if fit_btn:
-        try:
-            rr = fit_fopdt_global(t_global, u_global, y_global_fit, use_bias=False)
-            y_fit_plot = simulate_fopdt_global(rr["params"], t_global, u_global, y_global[0], use_bias=False)
-            residual_plot = y_global - y_fit_plot
-            sse_plot = float(np.sum(residual_plot ** 2))
-            rmse_plot = float(np.sqrt(sse_plot / len(y_global)))
-            sst_plot = float(np.sum((y_global - np.mean(y_global)) ** 2))
-            r2_plot = float(1.0 - sse_plot / sst_plot) if sst_plot > 0 else float("nan")
-            rr["y_fit_plot"] = y_fit_plot
-            rr["residual_plot"] = residual_plot
-            rr["SSE_plot"] = sse_plot
-            rr["RMSE_plot"] = rmse_plot
-            rr["R2_plot"] = r2_plot
-            rr["t_col"] = str(t_col)
-            rr["y_col"] = str(y_col)
-            rr["u_col"] = str(u_col)
-            rr["y_raw"] = y_global
-            rr["u_raw"] = u_global
-            rr["y_fit_used"] = y_global_fit
-            st.session_state["global_fopdt_last_result"] = rr
-        except Exception as e:
-            st.error(f"Global FOPDT fit failed: {e}")
+    st.subheader("Step 2: Run Fit")
+    if stale_result_msg:
+        st.warning(stale_result_msg)
 
-    global_result = st.session_state.get("global_fopdt_last_result", None)
-    if global_result is not None and len(global_result.get("t", [])) != len(t_global):
-        st.session_state["global_fopdt_last_result"] = None
-        global_result = None
+    if run_fit:
+        if downsampled["t"].size < 6:
+            st.error("Need at least 6 downsampled points to run the fit.")
+        else:
+            try:
+                status_placeholder.info("Fitting model...")
+                rr = run_global_fopdt_fit_cached(
+                    current_signature,
+                    downsampled["t"],
+                    downsampled["u"],
+                    downsampled["y"],
+                    t_global,
+                    u_global,
+                    y_global,
+                    initial_guess,
+                    lower_bounds,
+                    upper_bounds,
+                    int(global_maxiter),
+                    int(global_delay_grid),
+                    int(downsample_stride),
+                )
+                rr["t_col"] = str(t_col)
+                rr["y_col"] = str(y_col)
+                rr["u_col"] = str(u_col)
+                rr["y_raw"] = y_global
+                rr["u_raw"] = u_global
+                rr["y_fit_used"] = y_global_fit
+                rr["downsample_stride"] = int(downsample_stride)
+                st.session_state["global_fopdt_last_result"] = rr
+                st.session_state["global_fopdt_signature"] = current_signature
+                global_result = rr
+            except Exception as e:
+                st.error(f"Global FOPDT fit failed: {e}")
+            finally:
+                status_placeholder.empty()
 
     tabs = st.tabs(["Plot", "Results", "Download / Export"])
 
@@ -1161,6 +1403,7 @@ if global_fopdt_mode:
             ax.legend()
             st.pyplot(fig, clear_figure=True)
         else:
+            status_placeholder.info("Rendering plot...")
             fig, ax = plot_fopdt_global(
                 t_global,
                 y_global,
@@ -1170,11 +1413,12 @@ if global_fopdt_mode:
                 first_step_time=global_result["first_step_time"],
             )
             st.pyplot(fig, clear_figure=True)
+            status_placeholder.empty()
 
     with tabs[1]:
         st.subheader("Fit Results")
         if global_result is None:
-            st.info("Click **Fit model** to run the global FOPDT fit with the real pump-power column.")
+            st.info("Click **Run Global FOPDT Fit** to run the fit on demand.")
         else:
             st.write(
                 f"**K** = {global_result['K']:.6g}   |   **τ** = {global_result['tau']:.6g} s   |   "
@@ -1186,6 +1430,10 @@ if global_fopdt_mode:
             )
             st.write(
                 f"Columns used: `t = {global_result['t_col']}`   |   `y = {global_result['y_col']}`   |   `u = {global_result['u_col']}`"
+            )
+            st.caption(
+                f"Cached fit used downsampling = every {global_result['downsample_stride']} point, "
+                f"optimizer max iterations = {int(global_maxiter)}, dead-time grid samples = {int(global_delay_grid)}."
             )
 
     with tabs[2]:
