@@ -15,9 +15,12 @@ from fit_model import (
     fit_first_order as fit_Ka_tau,      # returns keys: Ka, tau, y0, ...
     fit_second_order as fit_Ka_tau2,    # returns keys: Ka, tau1, tau2, y0, ...
     fit_fopdt,                          # returns keys: K, tau, theta, y0, ...
+    fit_fopdt_global,                   # returns keys: K, tau, theta, ...
     fit_fopdt_ka,                       # returns keys: Ka, tau, theta, y0, ...
     fit_sopdt,                          # returns keys: Ka, tau1, tau2, theta, y0, ...
     fit_k_tau_global,                   # returns keys: K, tau, y0, ...
+    plot_fopdt_global,
+    simulate_fopdt_global,
 )
 
 # 2) K model (with a)
@@ -56,6 +59,37 @@ def estimate_step_time(t, y, window=5):
     dy = np.gradient(ys, t)
     i = int(np.argmax(np.abs(dy)))
     return float(t[i])
+
+
+def guess_pump_power_column(columns, exclude=None):
+    exclude = set([] if exclude is None else exclude)
+    best_col = None
+    best_score = -1
+    for col in columns:
+        if col in exclude:
+            continue
+        name = str(col).strip().lower()
+        score = 0
+        if "pump" in name:
+            score += 5
+        if "power" in name:
+            score += 4
+        if "current" in name:
+            score += 3
+        if "input" in name:
+            score += 3
+        if "percent" in name or "%" in name:
+            score += 2
+        if name in {"u", "pump", "power"}:
+            score += 2
+        if score > best_score:
+            best_col = col
+            best_score = score
+    if best_col is None:
+        for col in columns:
+            if col not in exclude:
+                return col
+    return best_col
 
 
 def make_excel_bytes(data_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
@@ -476,6 +510,7 @@ def fig_to_png_bytes(fig):
 # ----------------- Streamlit UI -----------------
 st.set_page_config(page_title="Process Fit Tool", layout="wide")
 FULL_MODEL_LABEL = "Full ON/OFF model (CHEG 330 Part D)"
+GLOBAL_FOPDT_LABEL = "Global FOPDT (full pump input)"
 
 st.title("Process Fit (Smooth GUI)")
 st.caption("Upload CSV/Excel → pick model → fit → visualize → download results")
@@ -496,6 +531,7 @@ with st.sidebar:
             "Fit K & τ (you enter step size a)",
             "Fit 2nd-order Ka, τ1, τ2",
             "FOPDT (K, τ, θ)",
+            GLOBAL_FOPDT_LABEL,
             "FOPDT (Ka, τ, θ)",
             "SOPDT (Ka, τ1, τ2, θ)",
             "Fit K & τ (entire system)",
@@ -505,6 +541,7 @@ with st.sidebar:
     )
 
     full_mode = model == FULL_MODEL_LABEL
+    global_fopdt_mode = model == GLOBAL_FOPDT_LABEL
 
     if cheg_auto_enabled:
         st.divider()
@@ -529,13 +566,13 @@ with st.sidebar:
         show_second_order = True
         show_grouped_onoff = True
 
-    if not full_mode:
+    if not full_mode and not global_fopdt_mode:
         fit_y0 = st.checkbox("Fit baseline y₀", value=True)
     else:
-        fit_y0 = True
+        fit_y0 = False
 
     st.divider()
-    if not full_mode:
+    if not full_mode and not global_fopdt_mode:
         st.subheader("Step timing")
         step_mode = st.radio(
             "Step time t₀",
@@ -548,7 +585,7 @@ with st.sidebar:
         std_override_on_off = st.checkbox("Override ON/OFF manually", value=False)
         std_on_manual = st.number_input("ON time for split (s)", value=0.0, step=1.0)
         std_off_manual = st.number_input("OFF time for split (s)", value=60.0, step=1.0)
-    else:
+    elif full_mode:
         step_mode = "Auto-detect t₀ from data"
         t0_manual = 0.0
         std_auto_split = True
@@ -563,6 +600,15 @@ with st.sidebar:
         auto_detect_on_off = st.checkbox("Auto-detect ON/OFF from data derivative", value=True)
         on_manual = st.number_input("Heater ON time (s)", value=0.0, step=1.0)
         off_manual = st.number_input("Heater OFF time (s)", value=60.0, step=1.0)
+    else:
+        step_mode = "Auto-detect t₀ from data"
+        t0_manual = 0.0
+        std_auto_split = False
+        std_segment_choice = "Heating"
+        std_override_on_off = False
+        std_on_manual = 0.0
+        std_off_manual = 60.0
+        st.caption("Global FOPDT uses the full dataset and the actual pump-power input column.")
 
     st.divider()
     st.subheader("Noise handling")
@@ -996,11 +1042,18 @@ if df.shape[1] < 2:
     st.stop()
 
 # Column selectors
-col1, col2, col3 = st.columns([1, 1, 2], gap="large")
+col1, col2, col3, col4 = st.columns([1, 1, 1, 2], gap="large")
 with col1:
     t_col = st.selectbox("Time column", options=list(df.columns), index=0)
 with col2:
     y_col = st.selectbox("Tank temperature column", options=list(df.columns), index=1)
+with col3:
+    if global_fopdt_mode:
+        pump_guess = guess_pump_power_column(list(df.columns), exclude={t_col, y_col})
+        pump_idx = list(df.columns).index(pump_guess) if pump_guess in df.columns else min(2, len(df.columns) - 1)
+        u_col = st.selectbox("Pump power column", options=list(df.columns), index=pump_idx)
+    else:
+        u_col = None
 
 extra_preview_cols = []
 if full_mode:
@@ -1014,10 +1067,149 @@ else:
     cool_in_col = "(none)"
     cool_out_col = "(none)"
 
-with col3:
+with col4:
     st.write("Preview (first 10 rows):")
-    preview_cols = [t_col, y_col] + [c for c in extra_preview_cols if c not in [t_col, y_col]]
+    preview_cols = [t_col, y_col]
+    if global_fopdt_mode and u_col is not None and u_col not in preview_cols:
+        preview_cols.append(u_col)
+    preview_cols.extend([c for c in extra_preview_cols if c not in preview_cols])
     st.dataframe(df[preview_cols].head(10), use_container_width=True)
+
+if global_fopdt_mode:
+    try:
+        t_all = parse_time_to_elapsed_seconds(df[t_col])
+    except Exception:
+        t_all = pd.to_numeric(df[t_col], errors="coerce").to_numpy(dtype=float)
+
+    y_all = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
+    u_all = pd.to_numeric(df[u_col], errors="coerce").to_numpy(dtype=float)
+
+    mask = np.isfinite(t_all) & np.isfinite(y_all) & np.isfinite(u_all)
+    t_global = t_all[mask]
+    y_global = y_all[mask]
+    u_global = u_all[mask]
+
+    if t_global.size < 6:
+        st.error("Need at least 6 valid time, tank-height, and pump-power points for global FOPDT.")
+        st.stop()
+
+    order = np.argsort(t_global)
+    t_global = t_global[order]
+    y_global = y_global[order]
+    u_global = u_global[order]
+
+    y_global_smooth = moving_average(y_global, smooth_window)
+    y_global_fit = y_global_smooth if use_smoothed_for_fit else y_global
+
+    st.subheader("Global FOPDT Debug")
+    st.write(f"Using columns: `t = {t_col}`   |   `y = {y_col}`   |   `u = {u_col}`")
+    debug_df = pd.DataFrame({
+        "t": t_global[:20],
+        "y": y_global[:20],
+        "u": u_global[:20],
+    })
+    st.write("First 20 values of `t`, `y`, and `u`:")
+    st.dataframe(debug_df, use_container_width=True)
+
+    fig_u, ax_u = plt.subplots()
+    ax_u.plot(t_global, u_global, color="tab:orange", linewidth=1.8)
+    ax_u.set_title("Pump Power Input Debug")
+    ax_u.set_xlabel("Time (s)")
+    ax_u.set_ylabel("Pump power u(t)")
+    ax_u.grid(True)
+    st.pyplot(fig_u, clear_figure=True)
+
+    if fit_btn:
+        try:
+            rr = fit_fopdt_global(t_global, u_global, y_global_fit, use_bias=False)
+            y_fit_plot = simulate_fopdt_global(rr["params"], t_global, u_global, y_global[0], use_bias=False)
+            residual_plot = y_global - y_fit_plot
+            sse_plot = float(np.sum(residual_plot ** 2))
+            rmse_plot = float(np.sqrt(sse_plot / len(y_global)))
+            sst_plot = float(np.sum((y_global - np.mean(y_global)) ** 2))
+            r2_plot = float(1.0 - sse_plot / sst_plot) if sst_plot > 0 else float("nan")
+            rr["y_fit_plot"] = y_fit_plot
+            rr["residual_plot"] = residual_plot
+            rr["SSE_plot"] = sse_plot
+            rr["RMSE_plot"] = rmse_plot
+            rr["R2_plot"] = r2_plot
+            rr["t_col"] = str(t_col)
+            rr["y_col"] = str(y_col)
+            rr["u_col"] = str(u_col)
+            rr["y_raw"] = y_global
+            rr["u_raw"] = u_global
+            rr["y_fit_used"] = y_global_fit
+            st.session_state["global_fopdt_last_result"] = rr
+        except Exception as e:
+            st.error(f"Global FOPDT fit failed: {e}")
+
+    global_result = st.session_state.get("global_fopdt_last_result", None)
+    if global_result is not None and len(global_result.get("t", [])) != len(t_global):
+        st.session_state["global_fopdt_last_result"] = None
+        global_result = None
+
+    tabs = st.tabs(["Plot", "Results", "Download / Export"])
+
+    with tabs[0]:
+        st.subheader("Global FOPDT Fit")
+        if global_result is None:
+            fig, ax = plt.subplots()
+            ax.plot(t_global, y_global, "k.", markersize=4, label="Measured data")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Tank height")
+            ax.grid(True)
+            ax.legend()
+            st.pyplot(fig, clear_figure=True)
+        else:
+            fig, ax = plot_fopdt_global(
+                t_global,
+                y_global,
+                global_result["y_fit_plot"],
+                global_result,
+                global_result["R2_plot"],
+                first_step_time=global_result["first_step_time"],
+            )
+            st.pyplot(fig, clear_figure=True)
+
+    with tabs[1]:
+        st.subheader("Fit Results")
+        if global_result is None:
+            st.info("Click **Fit model** to run the global recursive FOPDT fit with the real pump-power column.")
+        else:
+            st.write(
+                f"**K** = {global_result['K']:.6g}   |   **τ** = {global_result['tau']:.6g} s   |   "
+                f"**θ** = {global_result['theta']:.6g} s"
+            )
+            st.write(
+                f"**SSE** = {global_result['SSE_plot']:.6g}   |   **RMSE** = {global_result['RMSE_plot']:.6g}   |   "
+                f"**R²** = {global_result['R2_plot']:.6g}"
+            )
+            st.write(
+                f"Columns used: `t = {global_result['t_col']}`   |   `y = {global_result['y_col']}`   |   `u = {global_result['u_col']}`"
+            )
+
+    with tabs[2]:
+        st.subheader("Download / Export")
+        if global_result is None:
+            st.info("Fit first, then download CSV output.")
+        else:
+            out = pd.DataFrame({
+                "time_s": t_global,
+                "tank_height_meas": y_global,
+                "pump_power_u": u_global,
+                "tank_height_fit": global_result["y_fit_plot"],
+                "residual": global_result["residual_plot"],
+            })
+            csv_bytes = out.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download global FOPDT results CSV",
+                data=csv_bytes,
+                file_name="global_fopdt_fit_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    st.stop()
 
 if full_mode:
     try:
