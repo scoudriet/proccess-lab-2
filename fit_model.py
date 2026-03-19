@@ -699,6 +699,385 @@ def plot_fopdt_global(t, y, yhat, params, r2, first_step_time=None):
     return fig, ax
 
 
+def _unpack_global_second_order_params(params):
+    params = _as_1d_float_array(params, "params")
+    if params.size != 5:
+        raise ValueError(f"Expected 5 global second-order parameters, got {params.size}.")
+    K, tau1, tau2, theta, bias = map(float, params)
+    return K, tau1, tau2, theta, bias
+
+
+def simulate_global_second_order(params, t, u, y0):
+    K, tau1, tau2, theta, bias = _unpack_global_second_order_params(params)
+
+    t = np.asarray(t, dtype=float).flatten()
+    u = np.asarray(u, dtype=float).flatten()
+
+    if len(t) != len(u):
+        raise ValueError("t and u must have same length")
+
+    if len(t) == 0:
+        return np.array([], dtype=float)
+
+    if tau1 <= 0 or tau2 <= 0 or theta < 0:
+        return np.full_like(t, np.nan, dtype=float)
+
+    if len(t) == 1:
+        yfit = np.zeros_like(t, dtype=float)
+        yfit[0] = float(y0)
+        return yfit
+
+    dt_raw = np.diff(t)
+    dt = float(np.median(dt_raw))
+    if not np.isfinite(dt) or dt <= 0:
+        dt_pos = dt_raw[np.isfinite(dt_raw) & (dt_raw > 0)]
+        dt = float(np.median(dt_pos)) if dt_pos.size else float("nan")
+    if not np.isfinite(dt) or dt <= 0:
+        return np.full_like(t, np.nan, dtype=float)
+
+    n_delay = int(round(theta / dt))
+    u_delayed = _delay_input_by_samples(u, n_delay, fill_value=float(u[0]))
+
+    a1 = float(np.exp(-dt / tau1))
+    a2 = float(np.exp(-dt / tau2))
+    if not np.isfinite(a1) or not np.isfinite(a2) or a1 < 0.0 or a1 > 1.0 or a2 < 0.0 or a2 > 1.0:
+        return np.full_like(t, np.nan, dtype=float)
+
+    x1 = np.zeros_like(t, dtype=float)
+    yfit = np.zeros_like(t, dtype=float)
+    x1[0] = float(y0)
+    yfit[0] = float(y0)
+
+    for k in range(len(t) - 1):
+        y_ss = float(bias) + float(K) * float(u_delayed[k])
+        x1[k + 1] = a1 * x1[k] + (1.0 - a1) * y_ss
+        yfit[k + 1] = a2 * yfit[k] + (1.0 - a2) * x1[k + 1]
+        if not np.isfinite(yfit[k + 1]):
+            return np.full_like(t, np.nan, dtype=float)
+
+    return yfit
+
+
+def predict_global_second_order(params, t, u, y):
+    t, u, y = _clean_sort_u(t, u, y)
+    yhat = simulate_global_second_order(params, t, u, y0=float(y[0]))
+    if yhat.shape != y.shape or not np.all(np.isfinite(yhat)):
+        return np.full_like(y, np.nan, dtype=float)
+    return yhat
+
+
+def objective_global_second_order(params, t, u, y):
+    t, u, y = _clean_sort_u(t, u, y)
+    yhat = simulate_global_second_order(params, t, u, y0=float(y[0]))
+    if yhat.shape != y.shape or np.any(~np.isfinite(yhat)):
+        return 1e20
+    return float(np.sum((y - yhat) ** 2))
+
+
+def fit_global_second_order(
+    t,
+    u,
+    y,
+    initial_guess=None,
+    bounds=None,
+    maxiter=300,
+    max_delay_candidates=25,
+    refine_delay_window=2,
+):
+    t, u, y = _clean_sort_u(t, u, y)
+    if t.size < 8:
+        raise ValueError("Need at least 8 valid points to fit a global second-order model.")
+
+    dt_raw = np.diff(t)
+    dt = float(np.median(dt_raw))
+    if not np.isfinite(dt) or dt <= 0:
+        dt_pos = dt_raw[np.isfinite(dt_raw) & (dt_raw > 0)]
+        dt = float(np.median(dt_pos)) if dt_pos.size else float("nan")
+    if not np.isfinite(dt) or dt <= 0:
+        raise ValueError("Need strictly increasing time samples for global second-order fit.")
+
+    span_t = float(max(t[-1] - t[0], dt))
+    first_step_time = _detect_first_input_step_time(t, u)
+    theta0 = float(_estimate_dead_time_guess(t, u, y, theta_max=max(dt, 0.5 * span_t), dt_med=dt))
+
+    n0 = min(len(t), _initial_window_size_from_input(u))
+    y0_guess = float(np.mean(y[:n0]))
+    try:
+        coef, *_ = np.linalg.lstsq(
+            np.column_stack([u, np.ones_like(u, dtype=float)]),
+            y,
+            rcond=None,
+        )
+        K_lin = float(coef[0])
+        bias_lin = float(coef[1])
+    except Exception:
+        K_lin = 0.0
+        bias_lin = y0_guess
+
+    du_scale = max(float(np.ptp(u)), float(np.max(np.abs(u))), 1e-6)
+    dy_span = max(float(np.ptp(y)), abs(float(y[-1] - y[0])), float(np.std(y)), 1e-6)
+    if abs(K_lin) < 1e-12:
+        K_lin = float((np.max(y) - np.min(y)) / du_scale)
+        corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
+        if corr < 0:
+            K_lin *= -1.0
+
+    K0 = float(K_lin)
+    bias0 = float(bias_lin if np.isfinite(bias_lin) else y0_guess)
+    tau_base = float(max(0.1 * span_t, 5.0 * dt, 1e-6))
+    tau_min = max(1e-6, 0.05 * dt)
+    tau_max = max(5.0 * span_t, 10.0 * dt, 4.0 * tau_base)
+    tau1_0 = min(max(2.0 * tau_base, tau_min), tau_max)
+    tau2_0 = min(max(0.5 * tau_base, tau_min), tau_max)
+    theta_max = max(0.0, min(0.5 * span_t, span_t))
+    K_bound = max(10.0 * abs(K0), 10.0 * dy_span / du_scale, 1.0)
+    bias_margin = max(2.0 * dy_span, 1.0)
+
+    lower_full = np.array([-K_bound, tau_min, tau_min, 0.0, np.min(y) - bias_margin], dtype=float)
+    upper_full = np.array([K_bound, tau_max, tau_max, theta_max, np.max(y) + bias_margin], dtype=float)
+    starts = [
+        np.array([K0, tau1_0, tau2_0, bias0], dtype=float),
+        np.array([0.5 * K0 if abs(K0) > 1e-12 else max(0.1, dy_span / du_scale), min(max(3.0 * tau_base, tau_min), tau_max), min(max(0.3 * tau_base, tau_min), tau_max), bias0], dtype=float),
+        np.array([1.5 * K0 if abs(K0) > 1e-12 else max(0.1, dy_span / du_scale), min(max(1.5 * tau_base, tau_min), tau_max), min(max(0.7 * tau_base, tau_min), tau_max), bias0], dtype=float),
+    ]
+    initial_guess_used = np.array([K0, tau1_0, tau2_0, theta0, bias0], dtype=float)
+
+    if bounds is not None:
+        lower_in, upper_in = bounds
+        lower_full = np.asarray(lower_in, dtype=float).flatten()
+        upper_full = np.asarray(upper_in, dtype=float).flatten()
+        if lower_full.size != 5 or upper_full.size != 5:
+            raise ValueError("bounds must have 5 entries for the global second-order fit.")
+        if not np.all(np.isfinite(lower_full)) or not np.all(np.isfinite(upper_full)) or np.any(lower_full >= upper_full):
+            raise ValueError("bounds must be finite and satisfy lower < upper.")
+        tau_min = float(min(lower_full[1], lower_full[2]))
+        tau_max = float(max(upper_full[1], upper_full[2]))
+        theta0 = float(np.clip(theta0, lower_full[3], upper_full[3]))
+
+    if initial_guess is not None:
+        guess_arr = np.asarray(initial_guess, dtype=float).flatten()
+        if guess_arr.size != 5:
+            raise ValueError("initial_guess must have 5 entries for the global second-order fit.")
+        initial_guess_used = guess_arr.copy()
+        theta0 = float(np.clip(guess_arr[3], lower_full[3], upper_full[3]))
+        starts.insert(0, np.array([guess_arr[0], guess_arr[1], guess_arr[2], guess_arr[4]], dtype=float))
+
+    lower = np.array([lower_full[0], lower_full[1], lower_full[2], lower_full[4]], dtype=float)
+    upper = np.array([upper_full[0], upper_full[1], upper_full[2], upper_full[4]], dtype=float)
+
+    theta_min = float(max(0.0, lower_full[3]))
+    theta_max = float(max(theta_min, upper_full[3]))
+    n_delay_min = int(max(0, round(theta_min / dt)))
+    n_delay_max = int(max(n_delay_min, round(theta_max / dt)))
+
+    max_delay_candidates = int(max(5, max_delay_candidates))
+    refine_delay_window = int(max(0, refine_delay_window))
+    maxiter = int(max(10, maxiter))
+
+    if n_delay_max <= max_delay_candidates:
+        delay_candidates = np.arange(n_delay_min, n_delay_max + 1, dtype=int)
+    else:
+        delay_candidates = np.unique(np.round(np.linspace(n_delay_min, n_delay_max, max_delay_candidates)).astype(int))
+    theta_guess_idx = int(np.clip(round(theta0 / dt), n_delay_min, n_delay_max))
+    delay_candidates = np.unique(
+        np.concatenate([
+            delay_candidates,
+            np.array(
+                [theta_guess_idx, max(theta_guess_idx - 1, n_delay_min), min(theta_guess_idx + 1, n_delay_max)],
+                dtype=int,
+            ),
+        ])
+    )
+
+    def _assemble_params(x, theta_value):
+        x = np.asarray(x, dtype=float).flatten()
+        tau1_hat, tau2_hat = sorted([float(x[1]), float(x[2])], reverse=True)
+        return np.array([float(x[0]), tau1_hat, tau2_hat, float(theta_value), float(x[3])], dtype=float)
+
+    def _fit_continuous_for_theta(theta_value, extra_starts=None):
+        best_local = None
+        best_local_sse = np.inf
+        use_starts = list(starts)
+        if extra_starts:
+            use_starts.extend(extra_starts)
+
+        for x0 in use_starts:
+            x0 = np.clip(np.asarray(x0, dtype=float), lower, upper)
+
+            def residuals_local(x):
+                params_local = _assemble_params(x, theta_value)
+                yhat_local = simulate_global_second_order(params_local, t, u, y0=float(y[0]))
+                if yhat_local.shape != y.shape or not np.all(np.isfinite(yhat_local)):
+                    return np.full_like(y, 1e10, dtype=float)
+                return y - yhat_local
+
+            opt = least_squares(
+                residuals_local,
+                x0=x0,
+                bounds=(lower, upper),
+                method="trf",
+                max_nfev=maxiter,
+                loss="linear",
+            )
+            x_hat = np.clip(np.asarray(opt.x, dtype=float), lower, upper)
+            params_hat = _assemble_params(x_hat, theta_value)
+            residuals_hat = residuals_local(x_hat)
+            sse_hat = float(np.sum(residuals_hat ** 2))
+            if np.isfinite(sse_hat) and sse_hat < best_local_sse:
+                best_local = params_hat
+                best_local_sse = float(sse_hat)
+
+        return best_local, best_local_sse
+
+    best_params = None
+    best_sse = np.inf
+    best_delay = 0
+    for n_delay in delay_candidates:
+        theta_value = float(n_delay * dt)
+        params_hat, sse_hat = _fit_continuous_for_theta(theta_value)
+        if params_hat is not None and sse_hat < best_sse:
+            best_params = params_hat
+            best_sse = float(sse_hat)
+            best_delay = int(n_delay)
+
+    if best_params is None:
+        raise ValueError("Global second-order fit failed to converge.")
+
+    seeded_start = [np.array([best_params[0], best_params[1], best_params[2], best_params[4]], dtype=float)]
+    refine_delays = np.arange(
+        max(n_delay_min, best_delay - refine_delay_window),
+        min(n_delay_max, best_delay + refine_delay_window) + 1,
+        dtype=int,
+    )
+    for n_delay in refine_delays:
+        theta_value = float(n_delay * dt)
+        params_hat, sse_hat = _fit_continuous_for_theta(theta_value, extra_starts=seeded_start)
+        if params_hat is not None and sse_hat < best_sse:
+            best_params = params_hat
+            best_sse = float(sse_hat)
+            best_delay = int(n_delay)
+
+    best_params[1], best_params[2] = sorted([best_params[1], best_params[2]], reverse=True)
+    best_params[3] = float(best_delay * dt)
+    yhat = simulate_global_second_order(best_params, t, u, y0=float(y[0]))
+    if yhat.shape != y.shape or not np.all(np.isfinite(yhat)):
+        raise ValueError("Global second-order simulation became unstable at the fitted parameters.")
+
+    residuals = y - yhat
+    SSE = float(np.sum(residuals ** 2))
+    RMSE = float(np.sqrt(SSE / len(y)))
+    ybar = float(np.mean(y))
+    SStot = float(np.sum((y - ybar) ** 2))
+    R2 = float(1.0 - SSE / SStot) if SStot > 0 else float("nan")
+
+    K_hat, tau1_hat, tau2_hat, theta_hat, bias_hat = _unpack_global_second_order_params(best_params)
+    n_delay = int(round(theta_hat / dt))
+    u_delayed = _delay_input_by_samples(u, n_delay, fill_value=float(u[0]))
+
+    print(f"K = {_format_metric(K_hat)}")
+    print(f"tau1 = {_format_metric(tau1_hat)} s")
+    print(f"tau2 = {_format_metric(tau2_hat)} s")
+    print(f"theta = {_format_metric(theta_hat)} s")
+    print(f"bias = {_format_metric(bias_hat)}")
+    print(f"SSE = {_format_metric(SSE)}")
+    print(f"RMSE = {_format_metric(RMSE)}")
+    print(f"R^2 = {_format_metric(R2)}")
+
+    return {
+        "t": t,
+        "t_relative": t - float(first_step_time if first_step_time is not None else t[0]),
+        "u": u,
+        "u_fit": u,
+        "y": y,
+        "y_fit": yhat,
+        "residuals": residuals,
+        "params": best_params.copy(),
+        "K": float(K_hat),
+        "tau1": float(tau1_hat),
+        "tau2": float(tau2_hat),
+        "theta": float(theta_hat),
+        "bias": float(bias_hat),
+        "y_bias": float(bias_hat),
+        "y0": float(y[0]),
+        "dt": float(dt),
+        "n_delay": int(n_delay),
+        "u_delayed": u_delayed,
+        "u0": float(u[0]),
+        "y_ref": float(y[0]),
+        "SSE": SSE,
+        "RMSE": RMSE,
+        "R2": R2,
+        "K0": float(K0),
+        "tau1_0": float(tau1_0),
+        "tau2_0": float(tau2_0),
+        "theta0": float(theta0),
+        "bias0": float(bias0),
+        "first_step_time": first_step_time,
+        "initial_guess_used": initial_guess_used.copy(),
+        "bounds_used": (lower_full.copy(), upper_full.copy()),
+        "optimizer_maxiter": int(maxiter),
+        "max_delay_candidates": int(max_delay_candidates),
+    }
+
+
+def plot_global_second_order(t, y, yhat, params, r2, first_step_time=None):
+    t, y, yhat = _clean_sort_u(t, y, yhat)
+
+    if isinstance(params, dict):
+        K = float(params["K"])
+        tau1 = float(params["tau1"])
+        tau2 = float(params["tau2"])
+        theta = float(params["theta"])
+        t_rel_from_params = params.get("t_relative")
+        if first_step_time is None:
+            fst = params.get("first_step_time")
+            if fst is not None and np.isfinite(fst):
+                first_step_time = float(fst)
+    else:
+        params = _as_1d_float_array(params, "params")
+        t_rel_from_params = None
+        K, tau1, tau2, theta, _ = _unpack_global_second_order_params(params)
+
+    if t_rel_from_params is not None and len(np.ravel(t_rel_from_params)) == len(t):
+        t_rel = np.ravel(np.asarray(t_rel_from_params, dtype=float))
+    elif first_step_time is None:
+        first_step_time = float(t[0])
+        t_rel = t - float(first_step_time)
+    else:
+        t_rel = t - float(first_step_time)
+
+    fig, ax = plt.subplots()
+    ax.plot(t_rel, y, "k.", markersize=4, label="Measured data")
+    ax.plot(t_rel, yhat, color="red", linewidth=2.0, label="Global second-order fit")
+    ax.axvline(0.0, color="0.4", linestyle="--", linewidth=1.4, label="First step")
+
+    if theta > 0.0:
+        ax.axvline(theta, color="tab:blue", linestyle="--", linewidth=1.4, label="Dead time")
+        y_min = float(np.nanmin(np.concatenate([y, yhat])))
+        y_max = float(np.nanmax(np.concatenate([y, yhat])))
+        y_text = y_max - 0.06 * max(y_max - y_min, 1.0)
+        ax.annotate(
+            f"θ = {theta:.3g} s",
+            xy=(theta, y_text),
+            xytext=(4, 0),
+            textcoords="offset points",
+            rotation=90,
+            va="top",
+            ha="left",
+            color="tab:blue",
+        )
+
+    ax.set_title(
+        f"Global Second-Order Fit | K = {K:.6g}, tau1 = {tau1:.6g} s, tau2 = {tau2:.6g} s, theta = {theta:.6g} s, R² = {r2:.6g}"
+    )
+    ax.set_xlabel("Time relative to first step (s)")
+    ax.set_ylabel("Tank height")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig, ax
+
+
 def _first_order_from_input_response(t, u, K, tau, theta, y0=0.0, u0=0.0):
     """
     FOPDT response to an arbitrary input history with zero-order-hold input.

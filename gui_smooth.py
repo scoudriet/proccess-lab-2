@@ -16,11 +16,14 @@ from fit_model import (
     fit_second_order as fit_Ka_tau2,    # returns keys: Ka, tau1, tau2, y0, ...
     fit_fopdt,                          # returns keys: K, tau, theta, y0, ...
     fit_fopdt_global,                   # returns keys: K, tau, theta, ...
+    fit_global_second_order,            # returns keys: K, tau1, tau2, theta, bias, ...
     fit_fopdt_ka,                       # returns keys: Ka, tau, theta, y0, ...
     fit_sopdt,                          # returns keys: Ka, tau1, tau2, theta, y0, ...
     fit_k_tau_global,                   # returns keys: K, tau, y0, ...
     plot_fopdt_global,
+    plot_global_second_order,
     predict_fopdt_global,
+    predict_global_second_order,
     simulate_fopdt_global,
 )
 
@@ -239,6 +242,61 @@ def build_global_fit_defaults_cached(t: np.ndarray, u: np.ndarray, y: np.ndarray
 
 
 @st.cache_data(show_spinner=False)
+def build_global_second_order_defaults_cached(t: np.ndarray, u: np.ndarray, y: np.ndarray):
+    t = np.asarray(t, dtype=float)
+    u = np.asarray(u, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if t.size < 8:
+        return {"error": "Need at least 8 valid points to build second-order fit defaults."}
+
+    dt = np.diff(t)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        return {"error": "Need strictly increasing time samples."}
+
+    dt_med = float(np.median(dt))
+    span_t = float(max(t[-1] - t[0], dt_med))
+    du_scale = max(float(np.ptp(u)), float(np.max(np.abs(u))), 1e-9)
+    dy_span = max(float(np.ptp(y)), abs(float(y[-1] - y[0])), float(np.std(y)), 1e-6)
+    try:
+        coef, *_ = np.linalg.lstsq(
+            np.column_stack([u, np.ones_like(u, dtype=float)]),
+            y,
+            rcond=None,
+        )
+        K0 = float(coef[0])
+        bias0 = float(coef[1])
+    except Exception:
+        corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
+        sign = -1.0 if corr < 0 else 1.0
+        K0 = sign * max(dy_span / du_scale, 1e-3)
+        bias0 = float(np.mean(y[: max(3, len(y) // 10)]))
+
+    if abs(K0) < 1e-12:
+        corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
+        sign = -1.0 if corr < 0 else 1.0
+        K0 = sign * max(dy_span / du_scale, 1e-3)
+
+    tau_base = max(0.1 * span_t, 5.0 * dt_med)
+    tau_min = max(1e-6, 0.05 * dt_med)
+    tau_max = max(5.0 * span_t, 10.0 * dt_med, 4.0 * tau_base)
+    theta0 = 0.0
+    theta_max = max(0.0, min(0.5 * span_t, span_t))
+    K_bound = max(10.0 * abs(K0), 10.0 * dy_span / du_scale, 1.0)
+    y_margin = max(2.0 * dy_span, 1.0)
+    tau1_0 = min(max(2.0 * tau_base, tau_min), tau_max)
+    tau2_0 = min(max(0.5 * tau_base, tau_min), tau_max)
+
+    return {
+        "initial_guess": np.array([K0, tau1_0, tau2_0, theta0, bias0], dtype=float),
+        "bounds": (
+            np.array([-K_bound, tau_min, tau_min, 0.0, np.min(y) - y_margin], dtype=float),
+            np.array([K_bound, tau_max, tau_max, theta_max, np.max(y) + y_margin], dtype=float),
+        ),
+    }
+
+
+@st.cache_data(show_spinner=False)
 def run_global_fopdt_fit_cached(
     cache_key,
     t_fit: np.ndarray,
@@ -284,6 +342,63 @@ def run_global_fopdt_fit_cached(
     y_fit_plot = predict_fopdt_global(rr["params"], t_full, u_full, y_full_plot, use_bias=use_bias)
     if y_fit_plot.shape != y_full_plot.shape or np.any(~np.isfinite(y_fit_plot)):
         raise ValueError("Global FOPDT prediction failed on the full-resolution data.")
+    residual_plot = y_full_plot - y_fit_plot
+    sse_plot = float(np.sum(residual_plot ** 2))
+    rmse_plot = float(np.sqrt(sse_plot / len(y_full_plot)))
+    sst_plot = float(np.sum((y_full_plot - np.mean(y_full_plot)) ** 2))
+    r2_plot = float(1.0 - sse_plot / sst_plot) if sst_plot > 0 else float("nan")
+    rr["y_fit_plot"] = y_fit_plot
+    rr["residual_plot"] = residual_plot
+    rr["SSE_plot"] = sse_plot
+    rr["RMSE_plot"] = rmse_plot
+    rr["R2_plot"] = r2_plot
+    rr["fit_refined_on_full"] = bool(len(t_full) > len(t_fit))
+    return rr
+
+
+@st.cache_data(show_spinner=False)
+def run_global_second_order_fit_cached(
+    cache_key,
+    t_fit: np.ndarray,
+    u_fit: np.ndarray,
+    y_fit: np.ndarray,
+    t_full: np.ndarray,
+    u_full: np.ndarray,
+    y_full_fit: np.ndarray,
+    y_full_plot: np.ndarray,
+    initial_guess: np.ndarray,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
+    maxiter: int,
+    max_delay_candidates: int,
+    downsample_stride: int,
+):
+    del cache_key, downsample_stride
+    rr = fit_global_second_order(
+        t_fit,
+        u_fit,
+        y_fit,
+        initial_guess=initial_guess,
+        bounds=(lower_bounds, upper_bounds),
+        maxiter=maxiter,
+        max_delay_candidates=max_delay_candidates,
+    )
+
+    if len(t_full) > len(t_fit):
+        rr = fit_global_second_order(
+            t_full,
+            u_full,
+            y_full_fit,
+            initial_guess=rr["params"],
+            bounds=(lower_bounds, upper_bounds),
+            maxiter=max(40, min(int(maxiter), 120)),
+            max_delay_candidates=max(7, min(int(max_delay_candidates), 11)),
+            refine_delay_window=1,
+        )
+
+    y_fit_plot = predict_global_second_order(rr["params"], t_full, u_full, y_full_plot)
+    if y_fit_plot.shape != y_full_plot.shape or np.any(~np.isfinite(y_fit_plot)):
+        raise ValueError("Global second-order prediction failed on the full-resolution data.")
     residual_plot = y_full_plot - y_fit_plot
     sse_plot = float(np.sum(residual_plot ** 2))
     rmse_plot = float(np.sqrt(sse_plot / len(y_full_plot)))
@@ -717,6 +832,7 @@ def fig_to_png_bytes(fig):
 st.set_page_config(page_title="Process Fit Tool", layout="wide")
 FULL_MODEL_LABEL = "Full ON/OFF model (CHEG 330 Part D)"
 GLOBAL_FOPDT_LABEL = "Global FOPDT (full pump input)"
+GLOBAL_SECOND_ORDER_LABEL = "Global Second-Order Fit"
 
 st.title("Process Fit (Smooth GUI)")
 st.caption("Upload CSV/Excel → pick model → fit → visualize → download results")
@@ -738,6 +854,7 @@ with st.sidebar:
             "Fit 2nd-order Ka, τ1, τ2",
             "FOPDT (K, τ, θ)",
             GLOBAL_FOPDT_LABEL,
+            GLOBAL_SECOND_ORDER_LABEL,
             "FOPDT (Ka, τ, θ)",
             "SOPDT (Ka, τ1, τ2, θ)",
             "Fit K & τ (entire system)",
@@ -748,6 +865,8 @@ with st.sidebar:
 
     full_mode = model == FULL_MODEL_LABEL
     global_fopdt_mode = model == GLOBAL_FOPDT_LABEL
+    global_second_order_mode = model == GLOBAL_SECOND_ORDER_LABEL
+    global_model_mode = global_fopdt_mode or global_second_order_mode
 
     if cheg_auto_enabled:
         st.divider()
@@ -772,13 +891,13 @@ with st.sidebar:
         show_second_order = True
         show_grouped_onoff = True
 
-    if not full_mode and not global_fopdt_mode:
+    if not full_mode and not global_model_mode:
         fit_y0 = st.checkbox("Fit baseline y₀", value=True)
     else:
         fit_y0 = False
 
     st.divider()
-    if not full_mode and not global_fopdt_mode:
+    if not full_mode and not global_model_mode:
         st.subheader("Step timing")
         step_mode = st.radio(
             "Step time t₀",
@@ -814,7 +933,7 @@ with st.sidebar:
         std_override_on_off = False
         std_on_manual = 0.0
         std_off_manual = 60.0
-        st.caption("Global FOPDT uses the full dataset and the actual pump-power input column.")
+        st.caption("Global full-record models use the full dataset and the actual pump-power input column.")
 
     st.divider()
     st.subheader("Noise handling")
@@ -831,7 +950,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("File input")
-    sheet_default = "full data" if global_fopdt_mode else ""
+    sheet_default = "full data" if global_model_mode else ""
     sheet = st.text_input("Sheet name (blank = first sheet)", value=sheet_default)
     header = st.checkbox("First row is header", value=True)
 
@@ -840,11 +959,14 @@ with st.sidebar:
     else:
         a = None
 
-    if global_fopdt_mode:
+    if global_model_mode:
         st.divider()
         st.subheader("Global Fit")
         global_use_bias = True
-        st.caption("Global fit uses the full pump-power record and fits K, tau, theta, and bias.")
+        if global_fopdt_mode:
+            st.caption("Global fit uses the full pump-power record and fits K, tau, theta, and bias.")
+        else:
+            st.caption("Global second-order fit uses the full pump-power record and fits K, tau1, tau2, theta, and bias.")
         st.caption("Default working mapping: sheet = `full data`, t = column 1, y = column 2, u = column 5.")
         downsample_stride = st.selectbox(
             "Fit downsampling",
@@ -873,8 +995,9 @@ with st.sidebar:
         global_delay_grid = 25
 
     st.divider()
-    if global_fopdt_mode:
-        run_fit = st.button("Run Global FOPDT Fit", type="primary", use_container_width=True)
+    if global_model_mode:
+        run_label = "Run Global FOPDT Fit" if global_fopdt_mode else "Run Global Second-Order Fit"
+        run_fit = st.button(run_label, type="primary", use_container_width=True)
         fit_btn = False
     else:
         run_fit = False
@@ -1288,13 +1411,13 @@ status_placeholder.empty()
 # Column selectors
 col1, col2, col3, col4 = st.columns([1, 1, 1, 2], gap="large")
 t_label = "Time column"
-y_label = "Tank height column" if global_fopdt_mode else "Tank temperature column"
+y_label = "Tank height column" if global_model_mode else "Tank temperature column"
 with col1:
     t_col = st.selectbox(t_label, options=list(df.columns), index=0)
 with col2:
     y_col = st.selectbox(y_label, options=list(df.columns), index=min(1, len(df.columns) - 1))
 with col3:
-    if global_fopdt_mode:
+    if global_model_mode:
         if len(df.columns) >= 5:
             pump_idx = 4
         else:
@@ -1319,12 +1442,17 @@ else:
 with col4:
     st.write("Preview (first 10 rows):")
     preview_cols = [t_col, y_col]
-    if global_fopdt_mode and u_col is not None and u_col not in preview_cols:
+    if global_model_mode and u_col is not None and u_col not in preview_cols:
         preview_cols.append(u_col)
     preview_cols.extend([c for c in extra_preview_cols if c not in preview_cols])
     st.dataframe(df[preview_cols].head(10), use_container_width=True)
 
-if global_fopdt_mode:
+if global_model_mode:
+    global_result_key = "global_fopdt_last_result" if global_fopdt_mode else "global_second_order_last_result"
+    global_signature_key = "global_fopdt_signature" if global_fopdt_mode else "global_second_order_signature"
+    global_model_title = "Global FOPDT Fit" if global_fopdt_mode else "Global Second-Order Fit"
+    global_run_label = "Run Global FOPDT Fit" if global_fopdt_mode else "Run Global Second-Order Fit"
+
     st.subheader("Step 1: Preview Data and Select Columns")
     status_placeholder.info("Loading data...")
     global_prepped = preprocess_global_fopdt_data_cached(
@@ -1350,12 +1478,19 @@ if global_fopdt_mode:
     y_global_fit = y_global_smooth if use_smoothed_for_fit else y_global
 
     downsampled = downsample_global_arrays_cached(t_global, y_global_fit, u_global, int(downsample_stride))
-    fit_defaults = build_global_fit_defaults_cached(
-        downsampled["t"],
-        downsampled["u"],
-        downsampled["y"],
-        bool(global_use_bias),
-    )
+    if global_fopdt_mode:
+        fit_defaults = build_global_fit_defaults_cached(
+            downsampled["t"],
+            downsampled["u"],
+            downsampled["y"],
+            bool(global_use_bias),
+        )
+    else:
+        fit_defaults = build_global_second_order_defaults_cached(
+            downsampled["t"],
+            downsampled["u"],
+            downsampled["y"],
+        )
     if "error" in fit_defaults:
         st.error(fit_defaults["error"])
         st.stop()
@@ -1364,6 +1499,7 @@ if global_fopdt_mode:
     lower_bounds, upper_bounds = fit_defaults["bounds"]
 
     current_signature = (
+        global_model_title,
         file_signature,
         str(sheet_name),
         bool(header),
@@ -1381,11 +1517,11 @@ if global_fopdt_mode:
         tuple(np.round(upper_bounds, 12)),
     )
 
-    stored_result = st.session_state.get("global_fopdt_last_result")
-    stored_signature = st.session_state.get("global_fopdt_signature")
+    stored_result = st.session_state.get(global_result_key)
+    stored_signature = st.session_state.get(global_signature_key)
     stale_result_msg = None
     if stored_result is not None and stored_signature != current_signature:
-        stale_result_msg = "Selections changed. Click Run Global FOPDT Fit to update the cached result."
+        stale_result_msg = f"Selections changed. Click {global_run_label} to update the cached result."
         global_result = None
     else:
         global_result = stored_result
@@ -1396,7 +1532,10 @@ if global_fopdt_mode:
         f"(downsampling = every {int(downsample_stride)} point, preserving input changes)."
     )
     if global_use_bias:
-        st.caption("Bias fit is enabled for the global FOPDT model.")
+        if global_fopdt_mode:
+            st.caption("Bias fit is enabled for the global FOPDT model.")
+        else:
+            st.caption("Bias fit is enabled for the global second-order model.")
 
     debug_df = pd.DataFrame({
         "t": t_global[:20],
@@ -1419,28 +1558,47 @@ if global_fopdt_mode:
         st.warning(stale_result_msg)
 
     if run_fit:
-        if downsampled["t"].size < 6:
-            st.error("Need at least 6 downsampled points to run the fit.")
+        min_fit_points = 6 if global_fopdt_mode else 8
+        if downsampled["t"].size < min_fit_points:
+            st.error(f"Need at least {min_fit_points} downsampled points to run the fit.")
         else:
             try:
                 status_placeholder.info("Fitting model...")
-                rr = run_global_fopdt_fit_cached(
-                    current_signature,
-                    downsampled["t"],
-                    downsampled["u"],
-                    downsampled["y"],
-                    t_global,
-                    u_global,
-                    y_global_fit,
-                    y_global,
-                    initial_guess,
-                    lower_bounds,
-                    upper_bounds,
-                    int(global_maxiter),
-                    int(global_delay_grid),
-                    int(downsample_stride),
-                    bool(global_use_bias),
-                )
+                if global_fopdt_mode:
+                    rr = run_global_fopdt_fit_cached(
+                        current_signature,
+                        downsampled["t"],
+                        downsampled["u"],
+                        downsampled["y"],
+                        t_global,
+                        u_global,
+                        y_global_fit,
+                        y_global,
+                        initial_guess,
+                        lower_bounds,
+                        upper_bounds,
+                        int(global_maxiter),
+                        int(global_delay_grid),
+                        int(downsample_stride),
+                        bool(global_use_bias),
+                    )
+                else:
+                    rr = run_global_second_order_fit_cached(
+                        current_signature,
+                        downsampled["t"],
+                        downsampled["u"],
+                        downsampled["y"],
+                        t_global,
+                        u_global,
+                        y_global_fit,
+                        y_global,
+                        initial_guess,
+                        lower_bounds,
+                        upper_bounds,
+                        int(global_maxiter),
+                        int(global_delay_grid),
+                        int(downsample_stride),
+                    )
                 rr["t_col"] = str(t_col)
                 rr["y_col"] = str(y_col)
                 rr["u_col"] = str(u_col)
@@ -1449,18 +1607,19 @@ if global_fopdt_mode:
                 rr["y_fit_used"] = y_global_fit
                 rr["downsample_stride"] = int(downsample_stride)
                 rr["fit_use_bias"] = bool(global_use_bias)
-                st.session_state["global_fopdt_last_result"] = rr
-                st.session_state["global_fopdt_signature"] = current_signature
+                rr["fit_model_label"] = global_model_title
+                st.session_state[global_result_key] = rr
+                st.session_state[global_signature_key] = current_signature
                 global_result = rr
             except Exception as e:
-                st.error(f"Global FOPDT fit failed: {e}")
+                st.error(f"{global_model_title} failed: {e}")
             finally:
                 status_placeholder.empty()
 
     tabs = st.tabs(["Plot", "Results", "Download / Export"])
 
     with tabs[0]:
-        st.subheader("Global FOPDT Fit")
+        st.subheader(global_model_title)
         if global_result is None:
             fig, ax = plt.subplots()
             ax.plot(t_global, y_global, "k.", markersize=4, label="Measured data")
@@ -1471,28 +1630,45 @@ if global_fopdt_mode:
             st.pyplot(fig, clear_figure=True)
         else:
             status_placeholder.info("Rendering plot...")
-            fig, ax = plot_fopdt_global(
-                t_global,
-                y_global,
-                global_result["y_fit_plot"],
-                global_result,
-                global_result["R2_plot"],
-                first_step_time=global_result["first_step_time"],
-            )
+            if global_fopdt_mode:
+                fig, ax = plot_fopdt_global(
+                    t_global,
+                    y_global,
+                    global_result["y_fit_plot"],
+                    global_result,
+                    global_result["R2_plot"],
+                    first_step_time=global_result["first_step_time"],
+                )
+            else:
+                fig, ax = plot_global_second_order(
+                    t_global,
+                    y_global,
+                    global_result["y_fit_plot"],
+                    global_result,
+                    global_result["R2_plot"],
+                    first_step_time=global_result["first_step_time"],
+                )
             st.pyplot(fig, clear_figure=True)
             status_placeholder.empty()
 
     with tabs[1]:
         st.subheader("Fit Results")
         if global_result is None:
-            st.info("Click **Run Global FOPDT Fit** to run the fit on demand.")
+            st.info(f"Click **{global_run_label}** to run the fit on demand.")
         else:
-            st.write(
-                f"**K** = {global_result['K']:.6g}   |   **τ** = {global_result['tau']:.6g} s   |   "
-                f"**θ** = {global_result['theta']:.6g} s"
-            )
-            if global_result.get("fit_use_bias", False):
-                st.write(f"**y_bias** = {global_result['y_bias']:.6g}")
+            if global_fopdt_mode:
+                st.write(
+                    f"**K** = {global_result['K']:.6g}   |   **τ** = {global_result['tau']:.6g} s   |   "
+                    f"**θ** = {global_result['theta']:.6g} s"
+                )
+                if global_result.get("fit_use_bias", False):
+                    st.write(f"**y_bias** = {global_result['y_bias']:.6g}")
+            else:
+                st.write(
+                    f"**K** = {global_result['K']:.6g}   |   **τ1** = {global_result['tau1']:.6g} s   |   "
+                    f"**τ2** = {global_result['tau2']:.6g} s   |   **θ** = {global_result['theta']:.6g} s"
+                )
+                st.write(f"**bias** = {global_result['bias']:.6g}")
             st.write(
                 f"**SSE** = {global_result['SSE_plot']:.6g}   |   **RMSE** = {global_result['RMSE_plot']:.6g}   |   "
                 f"**R²** = {global_result['R2_plot']:.6g}"
@@ -1520,9 +1696,9 @@ if global_fopdt_mode:
             })
             csv_bytes = out.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "⬇️ Download global FOPDT results CSV",
+                "⬇️ Download global fit results CSV",
                 data=csv_bytes,
-                file_name="global_fopdt_fit_results.csv",
+                file_name="global_fopdt_fit_results.csv" if global_fopdt_mode else "global_second_order_fit_results.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
