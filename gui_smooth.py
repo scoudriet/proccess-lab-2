@@ -194,20 +194,35 @@ def build_global_fit_defaults_cached(t: np.ndarray, u: np.ndarray, y: np.ndarray
     span_t = float(max(t[-1] - t[0], dt_med))
     du_scale = max(float(np.ptp(u)), float(np.max(np.abs(u))), 1e-9)
     dy_span = max(float(np.ptp(y)), abs(float(y[-1] - y[0])), float(np.std(y)), 1e-6)
-    corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
-    sign = -1.0 if corr < 0 else 1.0
-    K0 = sign * max(dy_span / du_scale, 1e-3)
-    tau0 = max(0.2 * span_t, dt_med)
+    try:
+        coef, *_ = np.linalg.lstsq(
+            np.column_stack([u, np.ones_like(u, dtype=float)]),
+            y,
+            rcond=None,
+        )
+        K0 = float(coef[0])
+        bias0 = float(coef[1])
+    except Exception:
+        corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
+        sign = -1.0 if corr < 0 else 1.0
+        K0 = sign * max(dy_span / du_scale, 1e-3)
+        bias0 = float(np.mean(y[: max(3, len(y) // 10)]))
+
+    if abs(K0) < 1e-12:
+        corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
+        sign = -1.0 if corr < 0 else 1.0
+        K0 = sign * max(dy_span / du_scale, 1e-3)
+
+    tau0 = max(0.1 * span_t, 5.0 * dt_med)
     theta0 = 0.0
     K_bound = max(10.0 * abs(K0), 10.0 * dy_span / du_scale, 1.0)
-    tau_min = max(0.51 * dt_med, 1e-9)
+    tau_min = max(1e-6, 0.05 * dt_med)
     tau_max = max(5.0 * span_t, 10.0 * dt_med, 2.0 * tau0)
     theta_max = max(0.0, min(0.5 * span_t, span_t))
     if use_bias:
-        y_bias0 = float(np.mean(y[: max(3, len(y) // 10)]))
         y_margin = max(2.0 * dy_span, 1.0)
         return {
-            "initial_guess": np.array([K0, tau0, theta0, y_bias0], dtype=float),
+            "initial_guess": np.array([K0, tau0, theta0, bias0], dtype=float),
             "bounds": (
                 np.array([-K_bound, tau_min, 0.0, np.min(y) - y_margin], dtype=float),
                 np.array([K_bound, tau_max, theta_max, np.max(y) + y_margin], dtype=float),
@@ -816,7 +831,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("File input")
-    sheet = st.text_input("Sheet name (blank = first sheet)", value="")
+    sheet_default = "full data" if global_fopdt_mode else ""
+    sheet = st.text_input("Sheet name (blank = first sheet)", value=sheet_default)
     header = st.checkbox("First row is header", value=True)
 
     if model == "Fit K & τ (you enter step size a)":
@@ -827,15 +843,13 @@ with st.sidebar:
     if global_fopdt_mode:
         st.divider()
         st.subheader("Global Fit")
-        global_use_bias = st.checkbox(
-            "Fit output bias / baseline",
-            value=True,
-            help="Recommended for tank-height data with a nonzero operating level. This uses the bias form of the same global FOPDT model.",
-        )
+        global_use_bias = True
+        st.caption("Global fit uses the full pump-power record and fits K, tau, theta, and bias.")
+        st.caption("Default working mapping: sheet = `full data`, t = column 1, y = column 2, u = column 5.")
         downsample_stride = st.selectbox(
             "Fit downsampling",
             options=[1, 2, 5, 10],
-            index=2,
+            index=0,
             help="Use full-resolution data for plotting, but fit on every Nth sample while preserving input-change points.",
         )
         global_maxiter = st.number_input(
@@ -1273,14 +1287,19 @@ status_placeholder.empty()
 
 # Column selectors
 col1, col2, col3, col4 = st.columns([1, 1, 1, 2], gap="large")
+t_label = "Time column"
+y_label = "Tank height column" if global_fopdt_mode else "Tank temperature column"
 with col1:
-    t_col = st.selectbox("Time column", options=list(df.columns), index=0)
+    t_col = st.selectbox(t_label, options=list(df.columns), index=0)
 with col2:
-    y_col = st.selectbox("Tank temperature column", options=list(df.columns), index=1)
+    y_col = st.selectbox(y_label, options=list(df.columns), index=min(1, len(df.columns) - 1))
 with col3:
     if global_fopdt_mode:
-        pump_guess = guess_pump_power_column(list(df.columns), exclude={t_col, y_col})
-        pump_idx = list(df.columns).index(pump_guess) if pump_guess in df.columns else min(2, len(df.columns) - 1)
+        if len(df.columns) >= 5:
+            pump_idx = 4
+        else:
+            pump_guess = guess_pump_power_column(list(df.columns), exclude={t_col, y_col})
+            pump_idx = list(df.columns).index(pump_guess) if pump_guess in df.columns else min(2, len(df.columns) - 1)
         u_col = st.selectbox("Pump power column", options=list(df.columns), index=pump_idx)
     else:
         u_col = None

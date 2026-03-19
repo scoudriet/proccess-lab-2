@@ -43,7 +43,7 @@ def _median_positive_dt(t):
     return float(np.median(dt))
 
 
-def _delay_input_by_samples(u, n_delay):
+def _delay_input_by_samples(u, n_delay, fill_value=0.0):
     """
     Dead-time delay used by the recursive global FOPDT model.
 
@@ -56,8 +56,8 @@ def _delay_input_by_samples(u, n_delay):
     if n_delay == 0:
         return u.copy()
     if n_delay >= u.size:
-        return np.zeros_like(u, dtype=float)
-    return np.concatenate([np.zeros(n_delay, dtype=float), u[:-n_delay]])
+        return np.full_like(u, float(fill_value), dtype=float)
+    return np.concatenate([np.full(n_delay, float(fill_value), dtype=float), u[:-n_delay]])
 
 
 def _detect_first_input_step_time(t, u):
@@ -171,16 +171,11 @@ def _predict_fopdt_global_from_prepped(params, prep, use_bias=False):
 def predict_fopdt_global(params, t, u, y, use_bias=False):
     """
     Predict the full output trace for a global FOPDT parameter set.
-
-    This helper applies the same operating-point handling used during the fit:
-    the input is centered around its pre-step baseline and, for the no-bias
-    model, the output deviation is simulated and shifted back to the measured
-    tank-height baseline.
     """
-    prep = _prepare_global_fopdt_data(t, u, y, use_bias=use_bias)
-    yhat = _predict_fopdt_global_from_prepped(params, prep, use_bias=use_bias)
-    if yhat.shape != prep["y"].shape or not np.all(np.isfinite(yhat)):
-        return np.full_like(prep["y"], np.nan, dtype=float)
+    t, u, y = _clean_sort_u(t, u, y)
+    yhat = simulate_fopdt_global(params, t, u, y0=float(y[0]), use_bias=use_bias)
+    if yhat.shape != y.shape or not np.all(np.isfinite(yhat)):
+        return np.full_like(y, np.nan, dtype=float)
     return yhat
 
 
@@ -296,23 +291,24 @@ def _estimate_dead_time_guess(t, u, y, theta_max, dt_med):
 
 def simulate_fopdt_global(params, t, u, y0, use_bias=False):
     """
-    Simulate a global FOPDT model using a non-recursive convolution form.
+    Simulate the global first-order tank model over the full input record.
 
-    This global model must use the real input value u[k] at every time step.
-    It must not use the closed-form single-step FOPDT equation over the whole
-    dataset, because that would collapse repeated rises and drains into one
-    smooth exponential trend.
+    This is the exact website behavior requested for the full-dataset fit:
 
-    For the Euler-discretized model
-      y[k+1] = (1 - dt/tau) * y[k] + (dt/tau) * K * u_delayed[k]
-    this function evaluates the algebraically equivalent closed-form sum over
-    the full delayed input history instead of stepping recursively in Python.
+      y_ss[k] = bias + K * u_delayed[k]
+      yfit[k+1] = a * yfit[k] + (1 - a) * y_ss[k]
+
+    with
+      a = exp(-dt / tau)
+
+    The model uses the actual pump-power value at every time step and does not
+    apply a closed-form single-step response across the whole dataset.
     """
     if use_bias:
-        K, tau, theta, y_bias = _unpack_global_fopdt_params(params, use_bias=True)
+        K, tau, theta, bias = _unpack_global_fopdt_params(params, use_bias=True)
     else:
         K, tau, theta, _ = _unpack_global_fopdt_params(params, use_bias=False)
-        y_bias = None
+        bias = 0.0
 
     t = np.asarray(t, dtype=float).flatten()
     u = np.asarray(u, dtype=float).flatten()
@@ -336,46 +332,36 @@ def simulate_fopdt_global(params, t, u, y0, use_bias=False):
         return np.full_like(t, np.nan, dtype=float)
 
     n_delay = int(round(theta / dt))
+    u_delayed = _delay_input_by_samples(u, n_delay, fill_value=float(u[0]))
 
-    if n_delay > 0:
-        u_delayed = np.concatenate([np.zeros(n_delay), u[:-n_delay]])
-    else:
-        u_delayed = u.copy()
-
-    alpha = float(dt / tau)
-    if not np.isfinite(alpha) or alpha <= 0.0 or alpha >= 2.0:
+    a = float(np.exp(-dt / tau))
+    if not np.isfinite(a) or a < 0.0 or a > 1.0:
         return np.full_like(t, np.nan, dtype=float)
 
-    a = 1.0 - alpha
-    powers = np.power(a, np.arange(len(t), dtype=float))
-    if not np.all(np.isfinite(powers)):
+    yfit = np.zeros_like(t, dtype=float)
+    yfit[0] = float(y0)
+
+    for k in range(len(t) - 1):
+        y_ss = float(bias) + float(K) * float(u_delayed[k])
+        yfit[k + 1] = a * yfit[k] + (1.0 - a) * y_ss
+        if not np.isfinite(yfit[k + 1]):
+            return np.full_like(t, np.nan, dtype=float)
+
+    if not np.all(np.isfinite(yfit)):
         return np.full_like(t, np.nan, dtype=float)
 
-    kernel = (alpha * float(K)) * powers
-    conv_term = np.convolve(u_delayed, kernel, mode="full")
-
-    yhat = np.zeros_like(t, dtype=float)
-    yhat[0] = float(y0)
-    if len(t) > 1:
-        yhat[1:] = powers[1:] * float(y0) + conv_term[: len(t) - 1]
-        if use_bias:
-            yhat[1:] = yhat[1:] + float(y_bias) * (1.0 - powers[1:])
-
-    if not np.all(np.isfinite(yhat)):
-        return np.full_like(t, np.nan, dtype=float)
-
-    return yhat
+    return yfit
 
 
 def objective_fopdt_global(params, t, u, y, use_bias=False):
     """
-    Sum-of-squared-errors objective for the recursive global FOPDT model.
+    Sum-of-squared-errors objective for the full-record first-order model.
     """
-    prep = _prepare_global_fopdt_data(t, u, y, use_bias=use_bias)
-    residuals = _residuals_fopdt_global_from_prepped(params, prep, use_bias=use_bias)
-    if np.any(~np.isfinite(residuals)):
+    t, u, y = _clean_sort_u(t, u, y)
+    yhat = simulate_fopdt_global(params, t, u, y0=float(y[0]), use_bias=use_bias)
+    if yhat.shape != y.shape or np.any(~np.isfinite(yhat)):
         return 1e20
-    return float(np.sum(residuals ** 2))
+    return float(np.sum((y - yhat) ** 2))
 
 
 def fit_fopdt_global(
@@ -390,59 +376,62 @@ def fit_fopdt_global(
     refine_delay_window=2,
 ):
     """
-    Fit one global FOPDT model to the full dataset using a non-recursive
-    convolution evaluation of the full delayed input sequence.
+    Fit one global first-order-plus-dead-time model to the full dataset using
+    the full pump-power record and the exact recursive update
 
-    This is the correct whole-dataset formulation:
-      yhat[k+1] = yhat[k] + (dt/tau) * (-yhat[k] + K * u_delayed[k])
+      y_ss[k] = bias + K * u_delayed[k]
+      yfit[k+1] = a * yfit[k] + (1 - a) * y_ss[k]
 
-    and, optionally,
-      yhat[k+1] = yhat[k] + (dt/tau) * (-(yhat[k] - y_bias) + K * u_delayed[k])
+    with
+      a = exp(-dt / tau)
     """
-    prep = _prepare_global_fopdt_data(t, u, y, use_bias=use_bias)
-    t = prep["t"]
-    u = prep["u"]
-    y = prep["y"]
+    t, u, y = _clean_sort_u(t, u, y)
     if t.size < 6:
         raise ValueError("Need at least 6 valid points to fit a global FOPDT model.")
 
-    dt = float(np.median(np.diff(t)))
+    dt_raw = np.diff(t)
+    dt = float(np.median(dt_raw))
+    if not np.isfinite(dt) or dt <= 0:
+        dt_pos = dt_raw[np.isfinite(dt_raw) & (dt_raw > 0)]
+        dt = float(np.median(dt_pos)) if dt_pos.size else float("nan")
     if not np.isfinite(dt) or dt <= 0:
         raise ValueError("Need strictly increasing time samples for global FOPDT fit.")
+
     span_t = float(max(t[-1] - t[0], dt))
-    guess = _infer_full_dataset_guesses(t, prep["u_fit"], prep["y_target"])
-    K0 = float(guess["K0"])
-    tau0 = float(max(guess["tau0"], dt))
-    theta0 = float(
-        _estimate_dead_time_guess(
-            t,
-            prep["u_fit"],
-            prep["y_target"],
-            theta_max=max(dt, 0.5 * span_t),
-            dt_med=dt,
+    first_step_time = _detect_first_input_step_time(t, u)
+    theta0 = float(_estimate_dead_time_guess(t, u, y, theta_max=max(dt, 0.5 * span_t), dt_med=dt))
+
+    n0 = min(len(t), _initial_window_size_from_input(u))
+    y0_guess = float(np.mean(y[:n0]))
+    try:
+        coef, *_ = np.linalg.lstsq(
+            np.column_stack([u, np.ones_like(u, dtype=float)]),
+            y,
+            rcond=None,
         )
-    )
+        K_lin = float(coef[0])
+        bias_lin = float(coef[1])
+    except Exception:
+        K_lin = 0.0
+        bias_lin = y0_guess
 
-    if abs(K0) < 1e-12:
-        du_span = max(float(np.ptp(prep["u_fit"])), float(np.max(np.abs(prep["u_fit"]))), 1e-9)
-        K0 = float((np.max(prep["y_target"]) - np.min(prep["y_target"])) / du_span)
+    du_scale = max(float(np.ptp(u)), float(np.max(np.abs(u))), 1e-6)
+    dy_span = max(float(np.ptp(y)), abs(float(y[-1] - y[0])), float(np.std(y)), 1e-6)
+    if abs(K_lin) < 1e-12:
+        K_lin = float((np.max(y) - np.min(y)) / du_scale)
+        corr = float(np.dot(u - np.mean(u), y - np.mean(y)))
+        if corr < 0:
+            K_lin *= -1.0
 
-    dy_span = max(
-        float(np.ptp(prep["y_target"])),
-        abs(float(prep["y_target"][-1] - prep["y_target"][0])),
-        float(np.std(prep["y_target"])),
-        1e-6,
-    )
-    du_scale = max(float(np.ptp(prep["u_fit"])), float(np.max(np.abs(prep["u_fit"]))), 1e-6)
+    K0 = float(K_lin)
+    tau0 = float(max(0.1 * span_t, 5.0 * dt, 1e-6))
     K_bound = max(10.0 * abs(K0), 10.0 * dy_span / du_scale, 1.0)
-    tau_min = max(0.51 * dt, 1e-9)
+    tau_min = max(1e-6, 0.05 * dt)
     tau_max = max(5.0 * span_t, 10.0 * dt, 2.0 * tau0)
     theta_max = max(0.0, min(0.5 * span_t, span_t))
-    n_delay_max = int(max(0, round(theta_max / dt)))
-    first_step_time = prep["first_step_time"]
 
     if use_bias:
-        y_bias0 = float(prep["y_ref"] if prep["step_idx"] is not None and prep["step_idx"] > 0 else y[0])
+        y_bias0 = float(bias_lin if np.isfinite(bias_lin) else y0_guess)
         y_margin = max(2.0 * dy_span, 1.0)
         lower_full = np.array([-K_bound, tau_min, 0.0, np.min(y) - y_margin], dtype=float)
         upper_full = np.array([K_bound, tau_max, theta_max, np.max(y) + y_margin], dtype=float)
@@ -537,7 +526,10 @@ def fit_fopdt_global(
 
             def residuals_local(x):
                 params_local = _assemble_params(x, theta_value)
-                return _residuals_fopdt_global_from_prepped(params_local, prep, use_bias=use_bias)
+                yhat_local = simulate_fopdt_global(params_local, t, u, y0=float(y[0]), use_bias=use_bias)
+                if yhat_local.shape != y.shape or not np.all(np.isfinite(yhat_local)):
+                    return np.full_like(y, 1e10, dtype=float)
+                return y - yhat_local
 
             opt = least_squares(
                 residuals_local,
@@ -549,7 +541,7 @@ def fit_fopdt_global(
             )
             x_hat = np.clip(np.asarray(opt.x, dtype=float), lower, upper)
             params_hat = _assemble_params(x_hat, theta_value)
-            residuals_hat = _residuals_fopdt_global_from_prepped(params_hat, prep, use_bias=use_bias)
+            residuals_hat = residuals_local(x_hat)
             sse_hat = float(np.sum(residuals_hat ** 2))
             if np.isfinite(sse_hat) and sse_hat < best_local_sse:
                 best_local = params_hat
@@ -589,7 +581,7 @@ def fit_fopdt_global(
             best_delay = int(n_delay)
 
     best_params[2] = float(best_delay * dt)
-    yhat = _predict_fopdt_global_from_prepped(best_params, prep, use_bias=use_bias)
+    yhat = simulate_fopdt_global(best_params, t, u, y0=float(y[0]), use_bias=use_bias)
     if yhat.shape != y.shape or not np.all(np.isfinite(yhat)):
         raise ValueError("Global FOPDT simulation became unstable at the fitted parameters.")
 
@@ -602,7 +594,7 @@ def fit_fopdt_global(
 
     K_hat, tau_hat, theta_hat, y_bias_hat = _unpack_global_fopdt_params(best_params, use_bias=use_bias)
     n_delay = int(round(theta_hat / dt))
-    u_delayed = _delay_input_by_samples(prep["u_fit"], n_delay)
+    u_delayed = _delay_input_by_samples(u, n_delay, fill_value=float(u[0]))
 
     print(f"K = {_format_metric(K_hat)}")
     print(f"tau = {_format_metric(tau_hat)} s")
@@ -617,7 +609,7 @@ def fit_fopdt_global(
         "t": t,
         "t_relative": t - float(first_step_time if first_step_time is not None else t[0]),
         "u": u,
-        "u_fit": prep["u_fit"],
+        "u_fit": u,
         "y": y,
         "y_fit": yhat,
         "residuals": residuals,
@@ -632,8 +624,8 @@ def fit_fopdt_global(
         "dt": float(dt),
         "n_delay": int(n_delay),
         "u_delayed": u_delayed,
-        "u0": float(prep["u0"]),
-        "y_ref": float(prep["y_ref"]),
+        "u0": float(u[0]),
+        "y_ref": float(y[0]),
         "SSE": SSE,
         "RMSE": RMSE,
         "R2": R2,
