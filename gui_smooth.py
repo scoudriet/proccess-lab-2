@@ -20,6 +20,7 @@ from fit_model import (
     fit_sopdt,                          # returns keys: Ka, tau1, tau2, theta, y0, ...
     fit_k_tau_global,                   # returns keys: K, tau, y0, ...
     plot_fopdt_global,
+    predict_fopdt_global,
     simulate_fopdt_global,
 )
 
@@ -177,7 +178,7 @@ def downsample_global_arrays_cached(
 
 
 @st.cache_data(show_spinner=False)
-def build_global_fit_defaults_cached(t: np.ndarray, u: np.ndarray, y: np.ndarray):
+def build_global_fit_defaults_cached(t: np.ndarray, u: np.ndarray, y: np.ndarray, use_bias: bool):
     t = np.asarray(t, dtype=float)
     u = np.asarray(u, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -202,6 +203,17 @@ def build_global_fit_defaults_cached(t: np.ndarray, u: np.ndarray, y: np.ndarray
     tau_min = max(0.51 * dt_med, 1e-9)
     tau_max = max(5.0 * span_t, 10.0 * dt_med, 2.0 * tau0)
     theta_max = max(0.0, min(0.5 * span_t, span_t))
+    if use_bias:
+        y_bias0 = float(np.mean(y[: max(3, len(y) // 10)]))
+        y_margin = max(2.0 * dy_span, 1.0)
+        return {
+            "initial_guess": np.array([K0, tau0, theta0, y_bias0], dtype=float),
+            "bounds": (
+                np.array([-K_bound, tau_min, 0.0, np.min(y) - y_margin], dtype=float),
+                np.array([K_bound, tau_max, theta_max, np.max(y) + y_margin], dtype=float),
+            ),
+        }
+
     return {
         "initial_guess": np.array([K0, tau0, theta0], dtype=float),
         "bounds": (
@@ -219,36 +231,55 @@ def run_global_fopdt_fit_cached(
     y_fit: np.ndarray,
     t_full: np.ndarray,
     u_full: np.ndarray,
-    y_full: np.ndarray,
+    y_full_fit: np.ndarray,
+    y_full_plot: np.ndarray,
     initial_guess: np.ndarray,
     lower_bounds: np.ndarray,
     upper_bounds: np.ndarray,
     maxiter: int,
     max_delay_candidates: int,
     downsample_stride: int,
+    use_bias: bool,
 ):
     del cache_key, downsample_stride
     rr = fit_fopdt_global(
         t_fit,
         u_fit,
         y_fit,
-        use_bias=False,
+        use_bias=use_bias,
         initial_guess=initial_guess,
         bounds=(lower_bounds, upper_bounds),
         maxiter=maxiter,
         max_delay_candidates=max_delay_candidates,
     )
-    y_fit_plot = simulate_fopdt_global(rr["params"], t_full, u_full, y_full[0], use_bias=False)
-    residual_plot = y_full - y_fit_plot
+
+    if len(t_full) > len(t_fit):
+        rr = fit_fopdt_global(
+            t_full,
+            u_full,
+            y_full_fit,
+            use_bias=use_bias,
+            initial_guess=rr["params"],
+            bounds=(lower_bounds, upper_bounds),
+            maxiter=max(40, min(int(maxiter), 120)),
+            max_delay_candidates=max(7, min(int(max_delay_candidates), 11)),
+            refine_delay_window=1,
+        )
+
+    y_fit_plot = predict_fopdt_global(rr["params"], t_full, u_full, y_full_plot, use_bias=use_bias)
+    if y_fit_plot.shape != y_full_plot.shape or np.any(~np.isfinite(y_fit_plot)):
+        raise ValueError("Global FOPDT prediction failed on the full-resolution data.")
+    residual_plot = y_full_plot - y_fit_plot
     sse_plot = float(np.sum(residual_plot ** 2))
-    rmse_plot = float(np.sqrt(sse_plot / len(y_full)))
-    sst_plot = float(np.sum((y_full - np.mean(y_full)) ** 2))
+    rmse_plot = float(np.sqrt(sse_plot / len(y_full_plot)))
+    sst_plot = float(np.sum((y_full_plot - np.mean(y_full_plot)) ** 2))
     r2_plot = float(1.0 - sse_plot / sst_plot) if sst_plot > 0 else float("nan")
     rr["y_fit_plot"] = y_fit_plot
     rr["residual_plot"] = residual_plot
     rr["SSE_plot"] = sse_plot
     rr["RMSE_plot"] = rmse_plot
     rr["R2_plot"] = r2_plot
+    rr["fit_refined_on_full"] = bool(len(t_full) > len(t_fit))
     return rr
 
 
@@ -796,6 +827,11 @@ with st.sidebar:
     if global_fopdt_mode:
         st.divider()
         st.subheader("Global Fit")
+        global_use_bias = st.checkbox(
+            "Fit output bias / baseline",
+            value=True,
+            help="Recommended for tank-height data with a nonzero operating level. This uses the bias form of the same global FOPDT model.",
+        )
         downsample_stride = st.selectbox(
             "Fit downsampling",
             options=[1, 2, 5, 10],
@@ -817,6 +853,7 @@ with st.sidebar:
             step=5,
         )
     else:
+        global_use_bias = False
         downsample_stride = 1
         global_maxiter = 300
         global_delay_grid = 25
@@ -1294,7 +1331,12 @@ if global_fopdt_mode:
     y_global_fit = y_global_smooth if use_smoothed_for_fit else y_global
 
     downsampled = downsample_global_arrays_cached(t_global, y_global_fit, u_global, int(downsample_stride))
-    fit_defaults = build_global_fit_defaults_cached(downsampled["t"], downsampled["u"], downsampled["y"])
+    fit_defaults = build_global_fit_defaults_cached(
+        downsampled["t"],
+        downsampled["u"],
+        downsampled["y"],
+        bool(global_use_bias),
+    )
     if "error" in fit_defaults:
         st.error(fit_defaults["error"])
         st.stop()
@@ -1311,6 +1353,7 @@ if global_fopdt_mode:
         str(u_col),
         int(smooth_window),
         bool(use_smoothed_for_fit),
+        bool(global_use_bias),
         int(downsample_stride),
         int(global_maxiter),
         int(global_delay_grid),
@@ -1333,6 +1376,8 @@ if global_fopdt_mode:
         f"Fitting on {len(downsampled['t'])} of {len(t_global)} samples "
         f"(downsampling = every {int(downsample_stride)} point, preserving input changes)."
     )
+    if global_use_bias:
+        st.caption("Bias fit is enabled for the global FOPDT model.")
 
     debug_df = pd.DataFrame({
         "t": t_global[:20],
@@ -1367,6 +1412,7 @@ if global_fopdt_mode:
                     downsampled["y"],
                     t_global,
                     u_global,
+                    y_global_fit,
                     y_global,
                     initial_guess,
                     lower_bounds,
@@ -1374,6 +1420,7 @@ if global_fopdt_mode:
                     int(global_maxiter),
                     int(global_delay_grid),
                     int(downsample_stride),
+                    bool(global_use_bias),
                 )
                 rr["t_col"] = str(t_col)
                 rr["y_col"] = str(y_col)
@@ -1382,6 +1429,7 @@ if global_fopdt_mode:
                 rr["u_raw"] = u_global
                 rr["y_fit_used"] = y_global_fit
                 rr["downsample_stride"] = int(downsample_stride)
+                rr["fit_use_bias"] = bool(global_use_bias)
                 st.session_state["global_fopdt_last_result"] = rr
                 st.session_state["global_fopdt_signature"] = current_signature
                 global_result = rr
@@ -1424,6 +1472,8 @@ if global_fopdt_mode:
                 f"**K** = {global_result['K']:.6g}   |   **τ** = {global_result['tau']:.6g} s   |   "
                 f"**θ** = {global_result['theta']:.6g} s"
             )
+            if global_result.get("fit_use_bias", False):
+                st.write(f"**y_bias** = {global_result['y_bias']:.6g}")
             st.write(
                 f"**SSE** = {global_result['SSE_plot']:.6g}   |   **RMSE** = {global_result['RMSE_plot']:.6g}   |   "
                 f"**R²** = {global_result['R2_plot']:.6g}"
@@ -1433,7 +1483,8 @@ if global_fopdt_mode:
             )
             st.caption(
                 f"Cached fit used downsampling = every {global_result['downsample_stride']} point, "
-                f"optimizer max iterations = {int(global_maxiter)}, dead-time grid samples = {int(global_delay_grid)}."
+                f"optimizer max iterations = {int(global_maxiter)}, dead-time grid samples = {int(global_delay_grid)}, "
+                f"full-resolution refinement = {'on' if global_result.get('fit_refined_on_full') else 'off'}."
             )
 
     with tabs[2]:
