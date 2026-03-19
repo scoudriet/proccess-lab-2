@@ -1174,7 +1174,7 @@ if global_fopdt_mode:
     with tabs[1]:
         st.subheader("Fit Results")
         if global_result is None:
-            st.info("Click **Fit model** to run the global recursive FOPDT fit with the real pump-power column.")
+            st.info("Click **Fit model** to run the global FOPDT fit with the real pump-power column.")
         else:
             st.write(
                 f"**K** = {global_result['K']:.6g}   |   **τ** = {global_result['tau']:.6g} s   |   "

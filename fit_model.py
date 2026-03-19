@@ -273,12 +273,17 @@ def _estimate_dead_time_guess(t, u, y, theta_max, dt_med):
 
 def simulate_fopdt_global(params, t, u, y0, use_bias=False):
     """
-    Simulate a global FOPDT model by recursive time-domain integration.
+    Simulate a global FOPDT model using a non-recursive convolution form.
 
     This global model must use the real input value u[k] at every time step.
     It must not use the closed-form single-step FOPDT equation over the whole
     dataset, because that would collapse repeated rises and drains into one
     smooth exponential trend.
+
+    For the Euler-discretized model
+      y[k+1] = (1 - dt/tau) * y[k] + (dt/tau) * K * u_delayed[k]
+    this function evaluates the algebraically equivalent closed-form sum over
+    the full delayed input history instead of stepping recursively in Python.
     """
     if use_bias:
         K, tau, theta, y_bias = _unpack_global_fopdt_params(params, use_bias=True)
@@ -314,18 +319,27 @@ def simulate_fopdt_global(params, t, u, y0, use_bias=False):
     else:
         u_delayed = u.copy()
 
+    alpha = float(dt / tau)
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha >= 2.0:
+        return np.full_like(t, np.nan, dtype=float)
+
+    a = 1.0 - alpha
+    powers = np.power(a, np.arange(len(t), dtype=float))
+    if not np.all(np.isfinite(powers)):
+        return np.full_like(t, np.nan, dtype=float)
+
+    kernel = (alpha * float(K)) * powers
+    conv_term = np.convolve(u_delayed, kernel, mode="full")
+
     yhat = np.zeros_like(t, dtype=float)
     yhat[0] = float(y0)
-
-    for k in range(len(t) - 1):
+    if len(t) > 1:
+        yhat[1:] = powers[1:] * float(y0) + conv_term[: len(t) - 1]
         if use_bias:
-            dydt = (-(yhat[k] - y_bias) + K * u_delayed[k]) / tau
-        else:
-            dydt = (-yhat[k] + K * u_delayed[k]) / tau
-        yhat[k + 1] = yhat[k] + dt * dydt
+            yhat[1:] = yhat[1:] + float(y_bias) * (1.0 - powers[1:])
 
-        if not np.isfinite(yhat[k + 1]):
-            return np.full_like(t, np.nan, dtype=float)
+    if not np.all(np.isfinite(yhat)):
+        return np.full_like(t, np.nan, dtype=float)
 
     return yhat
 
@@ -344,7 +358,8 @@ def objective_fopdt_global(params, t, u, y, use_bias=False):
 
 def fit_fopdt_global(t, u, y, use_bias=False):
     """
-    Fit one global FOPDT model to the full dataset using recursive simulation.
+    Fit one global FOPDT model to the full dataset using a non-recursive
+    convolution evaluation of the full delayed input sequence.
 
     This is the correct whole-dataset formulation:
       yhat[k+1] = yhat[k] + (dt/tau) * (-yhat[k] + K * u_delayed[k])
